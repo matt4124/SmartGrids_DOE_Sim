@@ -4,8 +4,9 @@
 
 ### Setup
 - Setup Jupyter notebook 
-- Make a python virtual environment within the /SmartGrids_DOE_Sim folder
-- 
+- Make a python virtual environment within the /SmartGrids_DOE_Sim folder, or just use base python installation
+- run "pip install -r requirements.txt" in command prompt
+- Make sure PSS Sincal Version 22.5 is installed 
 
 ### File and Folder Descriptions
 **/opendss_networks**

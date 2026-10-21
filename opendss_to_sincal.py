@@ -113,6 +113,7 @@ PV_VOLTVAR_MODE = "volt_var"      # or "volt_pf" (cos-phi(V) approximation)
 #     - inject Q (positive) when V is low  (to raise voltage)
 #     - absorb Q (negative) when V is high (to lower voltage)
 # so the inductive region at the top of the curve must be *negative*.
+# (The old +1.0 had this inverted and pushed every converter unstable.)
 PV_Q_INDUCTIVE_SIGN = -1.0
 
 
@@ -200,25 +201,33 @@ def parse_matrix(s: str | None) -> list[list[float]] | None:
                 vals.append(float(v))
             except ValueError:
                 pass
-        while len(vals) < i + 1:
+        while len(vals) < i + 1:      # pad for lower triangular
             vals.append(0.0)
         mat.append(vals)
     return mat
 
 
 def _sym(m):
+    """Lower-triangular (or full) OpenDSS matrix -> full symmetric 2D list."""
     n = len(m)
     return [[m[i][j] if j < len(m[i]) else m[j][i] for j in range(n)]
             for i in range(n)]
 
 
 def _kron_reduce_last(Z):
+    """Eliminate the last conductor (assumed solidly grounded neutral)."""
     n = len(Z) - 1
     return [[Z[i][j] - Z[i][n] * Z[n][j] / Z[n][n] for j in range(n)]
             for i in range(n)]
 
 
 def _seq_from_phase_matrix(M):
+    """
+    Phase matrix (3x3, or smaller) -> (pos, zero, asymmetry).
+    3-phase:  Z1 = Zs - Zm,  Z0 = Zs + 2 Zm   (Zs = mean diag, Zm = mean offdiag)
+    1/2-phase: no mutual coupling is assumed, Z1 = Z0 = Zs, which reproduces
+    the loop impedance seen by a single-phase service/spur.
+    """
     n = len(M)
     diag = [M[i][i] for i in range(n)]
     zs = sum(diag) / n
@@ -231,6 +240,11 @@ def _seq_from_phase_matrix(M):
 
 
 def matrix_to_seq(Rmat, Xmat, Cmat, nphases: int):
+    """
+    Convert OpenDSS linecode R/X/C matrices into SINCAL sequence data.
+    A 4-conductor matrix (3 phases + neutral) is Kron-reduced first.
+    Returns per-length-unit values.
+    """
     if not Rmat:
         return None
     n = len(Rmat)
@@ -255,10 +269,18 @@ def matrix_to_seq(Rmat, Xmat, Cmat, nphases: int):
 
 PHASE_CODE = {frozenset({1}): 1, frozenset({2}): 2, frozenset({3}): 3,
               frozenset({1, 2}): 4, frozenset({2, 3}): 5, frozenset({1, 3}): 6,
-              frozenset({1, 2, 3}): 7}
+              frozenset({1, 2, 3}): 7}          # L1 L2 L3 L12 L23 L31 L123
 
 
 def load_connection(ld: dict) -> tuple[str, tuple[int, ...]]:
+    """
+    Work out how an OpenDSS load is connected from its bus1 terminals,
+    ``phases`` and ``conn``.  Returns (kind, phase_nodes):
+      ("3ph", (1,2,3))  balanced three-phase
+      ("1ph", (k,))     phase-to-neutral on phase k
+      ("ll",  (a, b))   phase-to-phase (delta) between a and b
+      ("2ph", (a, b))   two phases, wye (power split equally)
+    """
     raw = ld.get("bus1", [""])[0]
     nodes: list[int] = []
     for t in raw.split(".")[1:]:
@@ -289,12 +311,17 @@ def is_delta(conn: str | None) -> bool:
 
 
 def vecgrp_from_conns(c1: str | None, c2: str | None) -> tuple[int, str]:
+    """
+    OpenDSS winding connections -> SINCAL vector group (index, label).
+    Neutrals are grounded (OpenDSS default), so wye -> YN/yn.
+    """
     d1, d2 = is_delta(c1), is_delta(c2)
     return {(False, False): (5, "YNyn0"), (True, False): (10, "Dyn1"),
             (True, True): (1, "Dd0"), (False, True): (14, "YNd1")}[(d1, d2)]
 
 
 def phase_summary(loads: list[dict]) -> None:
+    """Print the allocation of load kW/kvar to phases L1/L2/L3."""
     tot = {1: [0.0, 0], 2: [0.0, 0], 3: [0.0, 0]}
     for ld in loads:
         try:
@@ -323,6 +350,7 @@ def phase_summary(loads: list[dict]) -> None:
 
 
 def strip_bus_node(bus: str) -> str:
+    """Return only the bus name (drop .N.N.N terminal suffix)."""
     return bus.split(".")[0] if bus else bus
 
 
@@ -333,6 +361,7 @@ def strip_bus_node(bus: str) -> str:
 def compute_layout(buses: list[str],
                    adjacency: dict[str, set[str]],
                    source: str | None) -> dict[str, tuple[float, float]]:
+    """Simple BFS-based layout: one horizontal 'column' per BFS depth."""
     depth: dict[str, int] = {}
     if source and source in adjacency:
         depth[source] = 0
@@ -354,8 +383,8 @@ def compute_layout(buses: list[str],
     for b, d in depth.items():
         by_depth.setdefault(d, []).append(b)
 
-    dx = 0.15
-    dy = 0.08
+    dx = 0.15     # m between depth levels
+    dy = 0.08     # m between nodes at the same depth
     pos: dict[str, tuple[float, float]] = {}
     for d in sorted(by_depth):
         row = sorted(by_depth[d])
@@ -390,11 +419,13 @@ class OpenDSSParser:
         self.vsources: list[dict] = []
         self.batchedits: list[tuple[str, str]] = []
 
+    # -- public --
     def parse(self) -> "OpenDSSParser":
         self._parse_file(self.master_file)
         self._apply_batchedits()
         return self
 
+    # -- internal --
     def _resolve(self, name: str) -> str | None:
         if os.path.isabs(name) and os.path.exists(name):
             return name
@@ -450,6 +481,7 @@ class OpenDSSParser:
     def _process_command(self, cmd: str) -> None:
         low = cmd.lower()
 
+        # redirect / compile
         m = re.match(r'(?:redirect|compile)\s+["\']?([^"\']+?)["\']?\s*$', low)
         if m:
             target = self._resolve(m.group(1).strip())
@@ -459,11 +491,13 @@ class OpenDSSParser:
                 print(f"  [warn] cannot resolve redirect '{m.group(1)}'")
             return
 
+        # set basefrequency / defaultbasefrequency
         m = re.match(r'set\s+(?:default)?basefrequency\s*=\s*([\d.]+)', low)
         if m:
             self.base_freq = float(m.group(1))
             return
 
+        # new circuit
         m = re.match(r'new\s+circuit\.(\S+)\s+(.*)', cmd, re.IGNORECASE)
         if m:
             self.circuit_name = m.group(1)
@@ -473,11 +507,13 @@ class OpenDSSParser:
                 self.source_bus = strip_bus_node(p["bus1"][0])
             return
 
+        # new linecode
         m = re.match(r'new\s+linecode\.(\S+)\s+(.*)', cmd, re.IGNORECASE)
         if m:
             self.linecodes[m.group(1).lower()] = parse_named_params(m.group(2))
             return
 
+        # new line (may be a switch)
         m = re.match(r'new\s+line\.(\S+)\s+(.*)', cmd, re.IGNORECASE)
         if m:
             name = m.group(1)
@@ -487,6 +523,7 @@ class OpenDSSParser:
             (self.switches if is_switch else self.lines).append(p)
             return
 
+        # new transformer
         m = re.match(r'new\s+transformer\.(\S+)\s+(.*)', cmd, re.IGNORECASE)
         if m:
             name = m.group(1)
@@ -496,6 +533,7 @@ class OpenDSSParser:
             self.transformers.append(p)
             return
 
+        # new reactor (groundings)
         m = re.match(r'new\s+reactor\.(\S+)\s+(.*)', cmd, re.IGNORECASE)
         if m:
             p = parse_named_params(m.group(2))
@@ -503,6 +541,7 @@ class OpenDSSParser:
             self.reactors.append(p)
             return
 
+        # new load
         m = re.match(r'new\s+load\.(\S+)\s+(.*)', cmd, re.IGNORECASE)
         if m:
             p = parse_named_params(m.group(2))
@@ -510,6 +549,7 @@ class OpenDSSParser:
             self.loads.append(p)
             return
 
+        # new vsource
         m = re.match(r'new\s+vsource\.(\S+)\s+(.*)', cmd, re.IGNORECASE)
         if m:
             p = parse_named_params(m.group(2))
@@ -517,6 +557,7 @@ class OpenDSSParser:
             self.vsources.append(p)
             return
 
+        # batchedit <class>..<regex> <edits>
         m = re.match(r'batchedit\s+(\S+)\s+(.*)', cmd, re.IGNORECASE)
         if m:
             self.batchedits.append((m.group(1), m.group(2)))
@@ -577,15 +618,17 @@ class SincalBuilder:
         self.sim = None
         self.sim_srv = None
 
+        # Layout / graphic bookkeeping
         self.positions: dict[str, tuple[float, float]] = {}
-        self._elem_count: dict[str, int] = {}
+        self._elem_count: dict[str, int] = {}     # elements placed at each bus
 
-        self._columns: dict[str, dict[str, str]] = {}
+        # PV / converter bookkeeping
+        self._columns: dict[str, dict[str, str]] = {}   # table -> {lower: real}
         self.unresolved: set[str] = set()
         self.vp_char_id: int | None = None
         self.unphased: list[str] = []
         self.ctrl_modes_missing = False
-        self.pending_phases: list[tuple[str, int]] = []
+        self.pending_phases: list[tuple[str, int]] = []   # (element name, code)
         self.phase_cols: list[tuple[str, str]] = []
 
     # ---- lifecycle -------------------------------------------------------
@@ -598,35 +641,6 @@ class SincalBuilder:
             raise RuntimeError(f"CreateDB returned {rc}")
         DBMgr = None
         time.sleep(0.5)
-
-        # Disable every alternative load-data source in CalcParameter.
-        # A freshly created database may have any of these set to 1; when
-        # the backing table is empty the LF then sets every load's effective
-        # P to 0 and produces a "converged" solve that is really a
-        # zero-injection network.  Column names are discovered from the
-        # schema so this works across SINCAL versions.
-        try:
-            con = sqlite3.connect(self.db_file)
-            try:
-                cols = {r[1].lower(): r[1] for r in
-                        con.execute('PRAGMA table_info("CalcParameter")')}
-                updates = []
-                for field, value in (("flag_usela", 0),
-                                     ("flag_useopser", 0),
-                                     ("flag_usetimeser", 0),
-                                     ("flag_useincser", 0)):
-                    if field in cols:
-                        updates.append(f'"{cols[field]}"={value}')
-                if updates:
-                    con.execute('UPDATE "CalcParameter" SET ' +
-                                ', '.join(updates))
-                    con.commit()
-                    print(f"    CalcParameter: disabled alternative load "
-                          f"data sources ({', '.join(updates)})")
-            finally:
-                con.close()
-        except sqlite3.Error as exc:
-            print(f"  [warn] could not update CalcParameter: {exc}")
 
     def open_database(self) -> None:
         self.sim_srv = win32com.client.Dispatch(f"Sincal.SimulationSrv.{COM_VER}")
@@ -644,7 +658,7 @@ class SincalBuilder:
             self._setparam(self.db, "UI_DEFAULTS", True)
             self._setparam(self.db, "COPY_GRAPHICDATA", True)
             try:
-                self._setparam(self.db, "GraphicArea", 1)
+                self._setparam(self.db, "GraphicArea", 1)   # default view
             except Exception:
                 pass
 
@@ -666,12 +680,15 @@ class SincalBuilder:
         except AttributeError:
             obj.Parameter(name, value)
 
+    # ---- layout helper ---------------------------------------------------
     def _symbol_pos(self, bus: str, side: int = +1) -> tuple[float, float]:
+        """Small offset from the node's position so node-type elements don't overlap."""
         x, y = self.positions.get(bus, (0.0, 0.0))
         n = self._elem_count.get(bus, 0)
         self._elem_count[bus] = n + 1
         return (x + 0.025 * n, y + side * 0.040)
 
+    # ---- element creators ------------------------------------------------
     def ensure_voltage_level(self, name: str, kv: float) -> int:
         if name in self.voltage_levels:
             return self.voltage_levels[name]
@@ -693,7 +710,7 @@ class SincalBuilder:
             return self.nodes[name]
         self._setparam(self.db, "NetworkLevel", vl_name)
         n = self.db.CreateNode(name)
-        n.SetValue("Node.Flag_Typ", 4)
+        n.SetValue("Node.Flag_Typ", 4)       # busbar
         n.Update()
         if self.graphics and name in self.positions:
             x, y = self.positions[name]
@@ -705,21 +722,20 @@ class SincalBuilder:
                         sk_mva=100.0, r_x=0.1):
         n = self.db.GetCommonObject("Node", node)
         inf = self.db.CreateElement("Infeeder", name, n)
-        inf.SetValue("Flag_Input", 1)
-        inf.SetValue("Flag_State", 1)
         Z = (kv ** 2) / sk_mva if sk_mva > 0 else 1e-6
         X = Z / math.sqrt(1 + r_x ** 2)
         R = r_x * X
-        inf.SetValue("Flag_Lf", 3)
-        inf.SetValue("Flag_Typ", 1)
+        inf.SetValue("Flag_Lf", 3)           # |usrc| & delta
+        inf.SetValue("Flag_Typ", 1)          # R & X
         inf.SetValue("R", R)
         inf.SetValue("X", X)
         inf.SetValue("R_X", r_x)
         inf.SetValue("Sk2", sk_mva)
         inf.SetValue("u", v_pu * 100.0)
         inf.SetValue("delta", angle_deg)
-        inf.SetValue("Flag_Z0", 1)
-        inf.SetValue("Flag_Z0_Input", 1)
+        # ---- zero-sequence: symmetric source (Z0 = Z1) ----
+        inf.SetValue("Flag_Z0", 1)           # fixed grounded
+        inf.SetValue("Flag_Z0_Input", 1)     # Z0/Z1 and R0/X0
         inf.SetValue("Z0_Z1", 1.0)
         inf.SetValue("R0_X0", r_x)
         inf.Update()
@@ -733,9 +749,10 @@ class SincalBuilder:
         n1 = self.db.GetCommonObject("Node", n1_name)
         n2 = self.db.GetCommonObject("Node", n2_name)
         ln = self.db.CreateElement("Line", name, n1, n2)
-        ln.SetValue("Flag_Input", 1)
-        ln.SetValue("Flag_State", 1)
-        ln.SetValue("Flag_LineTyp", 1)
+        ln.SetValue("Flag_LineTyp", 1)       # cable
+        # Floor the stored length at 1 m.  Some OpenDSS LV networks have
+        # sub-millimetre segments (67 um) that would otherwise trigger
+        # "2603 Short circuit impedance is equal to zero".
         ln.SetValue("Len", max(float(length_km), 1e-3))
         ln.SetValue("ParSys", 1.0)
         ln.SetValue("R", float(seq["R1"]))
@@ -743,17 +760,18 @@ class SincalBuilder:
         ln.SetValue("C", float(seq["C1"]))
         ln.SetValue("FrqNenn", float(self.freq))
         ln.SetValue("Flag_Lf", 1)
+        # ---- zero-sequence: explicit R0/X0, never 0 ----
         r0 = float(seq["R0"])
         x0 = float(seq["X0"])
         if abs(r0) < 1e-9 and abs(x0) < 1e-9:
             r0, x0 = 1e-5, 1e-5
-        ln.SetValue("Flag_Z0_Input", 2)
+        ln.SetValue("Flag_Z0_Input", 2)      # R0 and X0 directly
         ln.SetValue("R0", r0)
         ln.SetValue("X0", x0)
         try:
             ln.SetValue("C0", float(seq.get("C0", 0.0)))
         except Exception:
-            pass
+            pass        # C0 is optional; ignore if this DB version lacks it
         ln.Update()
         if self.graphics:
             ln.CreateGraphic()
@@ -764,9 +782,7 @@ class SincalBuilder:
         n1 = self.db.GetCommonObject("Node", n1_name)
         n2 = self.db.GetCommonObject("Node", n2_name)
         ln = self.db.CreateElement("Line", name, n1, n2)
-        ln.SetValue("Flag_Input", 1)
-        ln.SetValue("Flag_State", 1)
-        ln.SetValue("Flag_LineTyp", 3)
+        ln.SetValue("Flag_LineTyp", 3)       # connector
         ln.SetValue("Len", 0.001)
         ln.SetValue("ParSys", 1.0)
         ln.SetValue("R", 1e-5)
@@ -774,6 +790,7 @@ class SincalBuilder:
         ln.SetValue("C", 0.0)
         ln.SetValue("FrqNenn", float(self.freq))
         ln.SetValue("Flag_Lf", 1)
+        # ---- zero-sequence: explicit tiny R0/X0 (not 0, not default) ----
         ln.SetValue("Flag_Z0_Input", 2)
         ln.SetValue("R0", 1e-5)
         ln.SetValue("X0", 1e-5)
@@ -789,8 +806,6 @@ class SincalBuilder:
         n1 = self.db.GetCommonObject("Node", n1_name)
         n2 = self.db.GetCommonObject("Node", n2_name)
         t = self.db.CreateElement("TwoWindingTransformer", name, n1, n2)
-        t.SetValue("Flag_Input", 1)
-        t.SetValue("Flag_State", 1)
         t.SetValue("Sn", float(sn_mva))
         t.SetValue("Un1", float(kv1))
         t.SetValue("Un2", float(kv2))
@@ -800,7 +815,8 @@ class SincalBuilder:
         t.SetValue("VecGrp", int(vecgrp))
         t.SetValue("Flag_Lf", 1)
         t.SetValue("Flag_ConNode", 1)
-        t.SetValue("Flag_Z0_Input", 1)
+        # ---- zero-sequence: Dyn gives Z0 = Z1 (delta provides return path) ----
+        t.SetValue("Flag_Z0_Input", 1)       # Z0/Z1 and R0/X0
         t.SetValue("Z0_Z1", 1.0)
         t.SetValue("R0_X0", 0.1)
         t.Update()
@@ -810,26 +826,26 @@ class SincalBuilder:
         return t
 
     def create_load(self, name, node, p_mw, q_mvar, conn=None):
+        """
+        conn: (kind, phase_nodes) from load_connection(); None or "3ph" gives
+        the original balanced load.
+        """
         n = self.db.GetCommonObject("Node", node)
         ld = self.db.CreateElement("Load", name, n)
-        ld.SetValue("Flag_Input", 1)
-        ld.SetValue("Flag_State", 1)
         kind, ph = conn if conn else ("3ph", (1, 2, 3))
         ld.SetValue("Flag_Load", 1)
-        ld.SetValue("Flag_Typified", 3)
-        ld.SetValue("Flag_LoadType", 2)
-        ld.SetValue("Flag_Z0", 1)
-        ld.SetValue("Flag_Z0_Input", 1)
+        ld.SetValue("Flag_Typified", 3)      # household
+        ld.SetValue("Flag_LoadType", 2)      # P, Q constant
+        # ---- zero-sequence: grounded load, Z0 = Z1 ----
+        ld.SetValue("Flag_Z0", 1)            # fixed grounded
+        ld.SetValue("Flag_Z0_Input", 1)      # Z0/Z1 and R0/X0
         ld.SetValue("Z0_Z1", 1.0)
         ld.SetValue("R0_X0", 1.0)
         ld.SetValue("P", float(p_mw))
         ld.SetValue("Q", float(q_mvar))
-        ld.SetValue("fP", 1.0)
-        ld.SetValue("fQ", 1.0)
-
         phase_set = kind in ("1ph", "ll")
         if phase_set:
-            self.queue_phase(name, ph)
+            self.queue_phase(name, ph)      # Terminal.Flag_Terminal, written post-build
         if kind == "3ph":
             ld.SetValue("Flag_Lf", 1)
             where = "L123"
@@ -837,14 +853,14 @@ class SincalBuilder:
             ld.SetValue("Flag_Lf", 1)
             where = "L" + "".join(str(k) for k in sorted(ph))
         elif kind == "2ph":
-            ld.SetValue("Flag_Lf", 13)
+            ld.SetValue("Flag_Lf", 13)       # Pi, Qi and (v) - star
             for k in (1, 2, 3):
                 share = (1.0 / len(ph)) if k in ph else 0.0
                 ld.SetValue(f"P{k}", float(p_mw) * share)
                 ld.SetValue(f"Q{k}", float(q_mvar) * share)
             where = "L" + "".join(str(k) for k in ph)
-        else:
-            ld.SetValue("Flag_Lf", 14)
+        else:                                # "ll": phase-to-phase
+            ld.SetValue("Flag_Lf", 14)       # Pij, Qij and (v) - delta
             key = {frozenset({1, 2}): "12", frozenset({2, 3}): "23",
                    frozenset({1, 3}): "31"}[frozenset(ph)]
             for kk in ("12", "23", "31"):
@@ -863,12 +879,11 @@ class SincalBuilder:
     def create_shunt_impedance(self, name, node, r_ohm, x_ohm, kv):
         n = self.db.GetCommonObject("Node", node)
         sh = self.db.CreateElement("ShuntImpedance", name, n)
-        sh.SetValue("Flag_Input", 1)
-        sh.SetValue("Flag_State", 1)
         sh.SetValue("Un", float(kv))
         sh.SetValue("R", float(r_ohm))
         sh.SetValue("X", float(x_ohm))
         sh.SetValue("Flag_Lf", 1)
+        # ---- zero-sequence: grounded shunt, Z0 = Z1 ----
         sh.SetValue("Flag_Z0", 1)
         sh.SetValue("Flag_Z0_Input", 1)
         sh.SetValue("Z0_Z1", 1.0)
@@ -882,6 +897,7 @@ class SincalBuilder:
 
     # ---- converter (PV) support -----------------------------------------
     def read_schema(self, tables=None) -> None:
+        """Read table/column names from the SQLite database (read-only)."""
         try:
             con = sqlite3.connect(f"file:{self.db_file}?mode=ro", uri=True)
             names = [r[0] for r in con.execute(
@@ -932,6 +948,7 @@ class SincalBuilder:
             raise RuntimeError("terminal phase NOT set for: " + ", ".join(failed))
 
     def report_phase_status(self, use_varshunt: bool = False) -> None:
+        """Show how loads / converters ended up distributed over L1/L2/L3."""
         names = {1: "L1", 2: "L2", 3: "L3", 4: "L12", 5: "L23", 6: "L31",
                  7: "L123", 8: "N"}
         tables = [("Load", "Loads     ")]
@@ -957,6 +974,7 @@ class SincalBuilder:
                 print(f"    {label} by terminal phase in database: {part}")
 
     def report_converters_sql(self, use_varshunt: bool = False) -> None:
+        """Read the converters / PV shunts back to confirm what was stored."""
         try:
             con = sqlite3.connect(f"file:{self.db_file}?mode=ro", uri=True)
             if use_varshunt:
@@ -1002,6 +1020,7 @@ class SincalBuilder:
                       + ", ".join(bad))
 
     def create_characteristic(self, name: str, char_type: int, points):
+        """Create a Characteristic (+ CharacteristicValue rows); returns its id."""
         try:
             ch = self.db.CreateObject("Characteristic")
             ch.SetValue("Name", name)
@@ -1023,24 +1042,41 @@ class SincalBuilder:
             return None
 
     def _create_pv_varshunt(self, name, node, n, p_rated, sn, cfg, phases, kv_ll):
+        """
+        Single-phase PV as a VarShuntElement (boundary injection).
+
+        Unlike DCInfeeder, VarShuntElement carries the full zero-sequence model
+        (Flag_Z0_Input / Z0_Z1 / R0_X0), so a single-phase terminal does not
+        make the LF_USYM zero-sequence network singular.  This is what lets
+        a residential PV system be modelled on the same phase as the
+        residential load.
+
+        The power field is ``Plf`` / ``Qlf`` / ``Ulf`` (lowercase 'l'), not
+        ``PIf`` / ``QIf`` / ``UIf`` as written in the DB-description PDF.
+        SetValue with the wrong spelling is silently swallowed by SINCAL,
+        so this method reads the field back and raises if the write did
+        not stick.
+        """
         pv = self.db.CreateElement("VarShuntElement", name, n)
-        pv.SetValue("Flag_Input", 1)
-        pv.SetValue("Flag_State", 1)
-        pv.SetValue("Flag_LF", 1)
-        pv.SetValue("Flag_LoadType", 2)
+
+        # --- Power flow type ---
+        pv.SetValue("Flag_LF", 1)                 # 1 = Power (Plf / Qlf)
+        pv.SetValue("Flag_LoadType", 2)           # 2 = P and Q constant
         want = PV_SHUNT_P_SIGN * p_rated * float(cfg.output_pu)
         pv.SetValue("Plf", want)
-        pv.SetValue("Qlf", 0.0)
+        pv.SetValue("Qlf", 0.0)                   # unity PF
         pv.SetValue("Ulf", float(kv_ll))
-        pv.SetValue("f_p_k", 1.0)
-        pv.SetValue("f_q_k", 1.0)
-        pv.SetValue("Flag_Z0_Input", 1)
+
+        # --- Zero-sequence data (identical convention to Load) ---
+        pv.SetValue("Flag_Z0_Input", 1)           # Z0/Z1 and R0/X0
         pv.SetValue("Z0_Z1", 1.0)
         pv.SetValue("R0_X0", 1.0)
         pv.SetValue("Pneg", 0.0)
         pv.SetValue("Qneg", 0.0)
+
         pv.Update()
 
+        # --- Read back and confirm the power field stuck ---
         try:
             got = float(pv.GetValue("Plf"))
         except Exception:
@@ -1067,54 +1103,59 @@ class SincalBuilder:
                             phases=(1, 2, 3), v_base=230.94, kv_ll=0.4,
                             vp_id=None, vq_id=None):
         std = PV_REGIONS[cfg.region]
-        sn = kva / 1000.0
-        p_rated = min(kwp, kva) / 1000.0
+        sn = kva / 1000.0                          # MVA
+        p_rated = min(kwp, kva) / 1000.0           # MW, inverter-limited
         n = self.db.GetCommonObject("Node", node)
 
+        # Single-phase PV: use VarShuntElement (has zero-sequence data).
         if cfg.use_varshunt:
             return self._create_pv_varshunt(name, node, n, p_rated, sn,
                                             cfg, phases, kv_ll)
 
+        # Balanced three-phase PV: use DCInfeeder with AS/NZS 4777.2.
         vv = std["vv"]
         pct = lambda v: 100.0 * v / v_base
 
         cv = self.db.CreateElement("DCInfeeder", name, n)
-        cv.SetValue("Flag_Input", 1)
-        cv.SetValue("Flag_State", 1)
-        cv.SetValue("Flag_DCtyp", 7)
-        cv.SetValue("Flag_Connect", 1)
+
+        # --- Basic / converter data ---
+        cv.SetValue("Flag_DCtyp", 7)               # photovoltaic system
+        cv.SetValue("Flag_Connect", 1)             # directly, no step-up trafo
         cv.SetValue("IslandOp", 0)
         cv.SetValue("Sn_Inverter", sn)
         cv.SetValue("Ur_Inverter", float(kv_ll))
         cv.SetValue("Umin_Inverter", 80.0)
         cv.SetValue("Umax_Inverter", 120.0)
-        cv.SetValue("Flag_Lf", 1)
+        cv.SetValue("Flag_Lf", 1)                  # P and Q
         cv.SetValue("P", PV_P_SIGN * p_rated)
         cv.SetValue("Q", 0.0)
         cv.SetValue("fP", float(cfg.output_pu))
         cv.SetValue("fQ", 1.0)
-        cv.SetValue("Flag_LfLimit", 5)
-        cv.SetValue("Flag_ChkType", 1)
-        cv.SetValue("Flag_LimitType", 1)
+
+        # --- Limits ---
+        cv.SetValue("Flag_LfLimit", 5)             # limits on P and Q
+        cv.SetValue("Flag_ChkType", 1)             # warning on violation
+        cv.SetValue("Flag_LimitType", 1)           # limits act on the output
         cv.SetValue("Pmax", p_rated)
         cv.SetValue("Pmin", 0.0)
         q_lim = max(std["q_cap"], std["q_ind"]) * sn
         cv.SetValue("Qmax", q_lim)
         cv.SetValue("Qmin", -q_lim)
         cv.SetValue("cosphi_lim", round(math.sqrt(1 - std["q_ind"] ** 2), 3))
-        cv.SetValue("Flag_CtrlPrior", 2)
+        cv.SetValue("Flag_CtrlPrior", 2)           # reactive power priority
 
+        # --- Controller: AS/NZS 4777.2 volt-watt and volt-var ---
         if vp_id is not None:
-            cv.SetValue("Flag_Pctrl", 1)
+            cv.SetValue("Flag_Pctrl", 1)           # Volt-watt (of Pn)
             cv.SetValue("Qctrl_U_P_ID", int(vp_id))
         if PV_VOLTVAR_MODE == "volt_var" and vq_id is not None:
-            cv.SetValue("Flag_Qctrl", 3)
+            cv.SetValue("Flag_Qctrl", 3)           # Volt-var
             cv.SetValue("Qctrl_U_Q_ID", int(vq_id))
             q_pu = max(std["q_cap"], std["q_ind"])
             cv.SetValue("Qctrl_Qmin", -q_pu)
             cv.SetValue("Qctrl_Qmax",  q_pu)
         elif PV_VOLTVAR_MODE == "volt_pf":
-            cv.SetValue("Flag_Qctrl", 1)
+            cv.SetValue("Flag_Qctrl", 1)           # Volt-power factor
             cv.SetValue("Qctrl_cosphi_c", -round(math.sqrt(1 - std["q_cap"] ** 2), 4))
             cv.SetValue("Qctrl_U1_c", round(pct(vv[1]), 2))
             cv.SetValue("Qctrl_U2_c", round(pct(vv[0]), 2))
@@ -1137,16 +1178,6 @@ class SincalBuilder:
         Sim = SimSrv.GetSimulation()
         Sim.Database(self.conn)
         Sim.SetParameter("IDENTIFICATION", "Name")
-        # Belt-and-braces: clear the same alt-data-source flags the DB
-        # sets, in case a caller has changed them since create_database().
-        for param, value in (("LFDATA_USE_LOAD_ASSIGN",      0),
-                             ("LFDATA_USE_TIME_SERIES",      0),
-                             ("LFDATA_USE_OPERATING_POINT",  0),
-                             ("LFDATA_USE_LOAD_INCREASE",    0)):
-            try:
-                Sim.SetParameter(param, value)
-            except Exception:
-                pass
         Sim.LoadDB(method)
         Sim.Start(method)
         status = Sim.StatusID
@@ -1208,6 +1239,7 @@ def build_bus_voltage_map(parser: OpenDSSParser) -> dict[str, float]:
 
 
 def build_linecode_lookup(parser: OpenDSSParser) -> dict[str, dict]:
+    """linecode name -> sequence data per *linecode length unit* (+ 'units')."""
     out: dict[str, dict] = {}
     for name, p in parser.linecodes.items():
         try:
@@ -1264,6 +1296,7 @@ def convert_length_to_km(value: float, units: str) -> float:
 def select_pv_buses(parser: OpenDSSParser, bus_kv: dict[str, float],
                     cfg: PVConfig, phase_aware: bool = True
                     ) -> list[tuple[str, tuple[int, ...]]]:
+    """Pick a random cfg.pct % of candidate LV buses."""
     host: dict[str, tuple[int, ...]] = {}
     for ld in parser.loads:
         b = strip_bus_node(ld.get("bus1", [""])[0])
@@ -1291,6 +1324,11 @@ def _rename_bus(raw: str, alias: dict[str, str]) -> str:
 
 
 def merge_closed_switches_in(parser: OpenDSSParser) -> int:
+    """
+    Merge the two buses of every *closed* switch (name contains 'closed') into
+    one node and drop the switch.  Exact for a zero-impedance closed switch;
+    reduces the node count (the demo/student licence allows only 50 nodes).
+    """
     closed = [sw for sw in parser.switches if "closed" in sw["_name"].lower()]
     uf: dict[str, str] = {}
 
@@ -1338,6 +1376,7 @@ def merge_closed_switches_in(parser: OpenDSSParser) -> int:
 
 
 def is_neutral_grounding(rx: dict) -> bool:
+    """True for reactors that earth a neutral (bus1=x.4 / x.0, or series to earth)."""
     terms = rx.get("bus1", [""])[0].split(".")[1:]
     phase_terms = [t for t in terms if t in ("1", "2", "3")]
     neutral = any(t in ("0", "4") for t in terms)
@@ -1371,6 +1410,7 @@ def run_conversion(master: str, out_dir: str | None, out_name: str | None,
     print(f"    loads        : {len(parser.loads)}")
     print(f"    reactors     : {len(parser.reactors)}")
 
+    # ---- auto-merge of closed switches when the node count would exceed 50 ----
     if merge_closed_switches is None:
         approx = build_bus_voltage_map(parser)
         merge_closed_switches = len(approx) > 50
@@ -1388,6 +1428,7 @@ def run_conversion(master: str, out_dir: str | None, out_name: str | None,
     if phase_aware:
         phase_summary(parser.loads)
 
+    # ---- Build adjacency for BFS layout ----
     adjacency: dict[str, set[str]] = {b: set() for b in bus_kv}
 
     def _link(a, b):
@@ -1409,11 +1450,13 @@ def run_conversion(master: str, out_dir: str | None, out_name: str | None,
         print(f"    layout       : {len(positions)} node positions (BFS from "
               f"'{parser.source_bus}')")
 
+    # ---- output location ----
     if out_dir is None:
         out_dir = os.path.dirname(os.path.abspath(master))
     if out_name is None:
         out_name = parser.circuit_name or "OpenDSS_Net"
 
+    # -- build ---------------------------------------------------------------
     print(f"\n=== 2. Building PSS-SINCAL network '{out_name}'"
           f"{'' if not no_graphics else '  [graphics disabled]'}")
     b = SincalBuilder(out_dir, out_name, parser.base_freq,
@@ -1423,15 +1466,18 @@ def run_conversion(master: str, out_dir: str | None, out_name: str | None,
     b.read_schema()
     b.open_database()
 
+    # voltage levels
     vl_names: dict[float, str] = {}
     for kv in sorted(set(round(v, 3) for v in bus_kv.values()), reverse=True):
         name = f"{kv}kV".replace(".", "_").replace("-", "m")
         vl_names[kv] = name
         b.ensure_voltage_level(name, kv)
 
+    # nodes
     for bus, kv in bus_kv.items():
         b.ensure_node(bus, vl_names[round(kv, 3)])
 
+    # infeeders
     if parser.source_bus:
         b.create_infeeder(
             name="Source",
@@ -1454,6 +1500,7 @@ def run_conversion(master: str, out_dir: str | None, out_name: str | None,
             sk_mva=100.0,
         )
 
+    # transformers
     for t in parser.transformers:
         ws = t.get("_windings", [])
         if len(ws) < 2:
@@ -1479,6 +1526,7 @@ def run_conversion(master: str, out_dir: str | None, out_name: str | None,
         b.create_transformer(t["_name"], b1, b2, kv1, kv2, sn, uk, 0.5,
                              vecgrp=vg, vg_label=vg_label)
 
+    # lines
     for ln in parser.lines:
         name = ln["_name"]
         b1 = strip_bus_node(ln.get("bus1", [""])[0])
@@ -1502,11 +1550,13 @@ def run_conversion(master: str, out_dir: str | None, out_name: str | None,
                for k, v in seq.items()}
         b.create_line(name, b1, b2, L, seq)
 
+    # switches
     for sw in parser.switches:
         b1 = strip_bus_node(sw.get("bus1", [""])[0])
         b2 = strip_bus_node(sw.get("bus2", [""])[0])
         b.create_switch_line(sw["_name"], b1, b2)
 
+    # loads
     for ld in parser.loads:
         bus = strip_bus_node(ld.get("bus1", [""])[0])
         try:
@@ -1529,6 +1579,7 @@ def run_conversion(master: str, out_dir: str | None, out_name: str | None,
         conn = load_connection(ld) if phase_aware else None
         b.create_load(ld["_name"], bus, kw / 1000.0, kvar / 1000.0, conn)
 
+    # PV converters (random subset of customer buses)
     if pv.pct > 0:
         mode_label = "VarShuntElement at unity PF" if pv.use_varshunt \
                      else "DCInfeeder with AS/NZS 4777.2 controllers"
@@ -1541,6 +1592,7 @@ def run_conversion(master: str, out_dir: str | None, out_name: str | None,
             pc = lambda v: 100.0 * v / v_base
             vv = std["vv"]
             vp_id = vq_id = None
+            # Only the DCInfeeder path supports the AS/NZS 4777.2 characteristics.
             if not pv.use_varshunt:
                 vp_id = b.create_characteristic(
                     f"PV_VoltWatt_{pv.region}", 14,
@@ -1566,6 +1618,7 @@ def run_conversion(master: str, out_dir: str | None, out_name: str | None,
                                       pv, phases=phases, v_base=v_base,
                                       kv_ll=lv_kv, vp_id=vp_id, vq_id=vq_id)
 
+    # reactors (groundings -> shunt impedance)
     skipped_gnd = []
     for rx in parser.reactors:
         if not legacy_ground_shunts and is_neutral_grounding(rx):
@@ -1592,6 +1645,7 @@ def run_conversion(master: str, out_dir: str | None, out_name: str | None,
     if pv.pct > 0:
         b.report_converters_sql(use_varshunt=pv.use_varshunt)
 
+    # -- verify -------------------------------------------------------------
     print("\n=== 3. Verifying with a power flow")
     ok = b.verify_solve("LF_USYM" if phase_aware else "LF")
     print(f"\n=== DONE")
@@ -1606,24 +1660,51 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description="Convert an OpenDSS LV network into PSS-SINCAL V22.5.")
     ap.add_argument("master", help="Path to the OpenDSS master .dss file")
-    ap.add_argument("--outdir", default=None)
-    ap.add_argument("--name", default=None)
-    ap.add_argument("--no-graphics", action="store_true")
-    ap.add_argument("--merge-closed-switches", action="store_true", default=None)
+    ap.add_argument("--outdir", default=None,
+                    help="Directory where the .sin file is written")
+    ap.add_argument("--name", default=None,
+                    help="Name of the generated PSS-SINCAL network")
+    ap.add_argument("--no-graphics", action="store_true",
+                    help="Skip graphic creation (electrical model only)")
+    ap.add_argument("--merge-closed-switches", action="store_true", default=None,
+                    help="Merge buses joined by closed switches (cuts node "
+                         "count for the 50-node demo licence).  Default: auto - "
+                         "merge only when node count exceeds 50.")
     ap.add_argument("--no-merge-closed-switches", action="store_false",
-                    dest="merge_closed_switches")
-    ap.add_argument("--legacy-ground-shunts", action="store_true")
-    ap.add_argument("--balanced", action="store_true")
+                    dest="merge_closed_switches",
+                    help="Disable auto-merging of closed switches")
+    ap.add_argument("--legacy-ground-shunts", action="store_true",
+                    help="Model neutral-earthing reactors as 3-phase shunt "
+                         "impedances (old behaviour, NOT recommended)")
+    ap.add_argument("--balanced", action="store_true",
+                    help="Ignore OpenDSS phases: balanced loads, balanced "
+                         "power flow (the original behaviour)")
     g = ap.add_argument_group("PV generation")
-    g.add_argument("--pv-pct", type=float, default=0.0)
-    g.add_argument("--pv-seed", type=int, default=None)
-    g.add_argument("--pv-kva-list", default="5")
-    g.add_argument("--pv-kwp-ratio", type=float, default=1.0)
-    g.add_argument("--pv-output", type=float, default=1.0)
-    g.add_argument("--pv-all-lv-buses", action="store_true")
-    g.add_argument("--pv-region", default="A")
+    g.add_argument("--pv-pct", type=float, default=0.0,
+                   help="Percent of customer buses given a PV converter "
+                        "(0 = none, default)")
+    g.add_argument("--pv-seed", type=int, default=None,
+                   help="Random seed for repeatable bus selection / sizing")
+    g.add_argument("--pv-kva-list", default="5",
+                   help="Comma-separated inverter sizes in kVA drawn at "
+                        "random per site (default 5)")
+    g.add_argument("--pv-kwp-ratio", type=float, default=1.0,
+                   help="DC array kWp / inverter kVA (default 1.0)")
+    g.add_argument("--pv-output", type=float, default=1.0,
+                   help="fP: PV output as fraction of rated (default 1.0)")
+    g.add_argument("--pv-all-lv-buses", action="store_true",
+                   help="Candidates are all LV buses, not just buses with loads")
+    g.add_argument("--pv-region", default="A",
+                   help="AS/NZS 4777.2 region settings (default A)")
     g.add_argument("--pv-element", choices=["varshunt", "dcinfeeder"],
-                   default="varshunt")
+                   default="varshunt",
+                   help="Element used to represent PV.  'varshunt' (default) "
+                        "uses VarShuntElement, which supports single-phase "
+                        "terminals in LF_USYM (the Australian residential case). "
+                        "'dcinfeeder' uses DCInfeeder with the AS/NZS 4777.2 "
+                        "volt-var / volt-watt controllers; it has no "
+                        "zero-sequence model, so it can only be used in a "
+                        "balanced three-phase study.")
     args = ap.parse_args()
 
     if not 0.0 <= args.pv_pct <= 100.0:
@@ -1646,5 +1727,6 @@ def main() -> None:
         raise
 
 
+# python .\build_network.py "C:\Users\Matt\Documents\python_uni_projects\archive\Renewable Energy\MV-associated-LV\data\LV\LV1_14bus\Master.dss" --outdir "./new_network/" --no-graphics
 if __name__ == "__main__":
     main()
