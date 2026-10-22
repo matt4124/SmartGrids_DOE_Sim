@@ -91,6 +91,20 @@ def _names(db_file: str, table: str) -> list[str]:
         JOIN "Element" e ON e."Element_ID" = x."Element_ID" ORDER BY 1''')]
 
 
+# FIX: new helper - element name -> Element_ID, for the GetObj numeric fallback
+def _elem_ids(db_file: str, table: str) -> dict[str, int]:
+    rows = _query(db_file, f'''
+        SELECT e."Name", e."Element_ID" FROM "{table}" x
+        JOIN "Element" e ON e."Element_ID" = x."Element_ID"''')
+    return {r[0]: int(r[1]) for r in rows}
+
+
+# FIX: new helper - node name -> Node_ID
+def _node_ids(db_file: str) -> dict[str, int]:
+    return {r[0]: int(r[1]) for r in
+            _query(db_file, 'SELECT "Name", "Node_ID" FROM "Node"')}
+
+
 def _read_profiles(files: list[str], cols: list[str]) -> dict[str, pd.DataFrame]:
     out = {}
     for f in files:
@@ -157,8 +171,6 @@ def run_qsts(sin_file: str,
     replace       : sample CSVs with replacement. Default: only if fewer CSVs than loads
     step_callback : optional f(t, ctx) called before each power flow, for DOE
                     logic. ctx = dict(sim, loads, pvs, assignment, step).
-                    Loads/pvs are {name: calc object}; e.g. pvs[n].SetItem("Plf", x)
-                    overrides the PV profile for that step.
     """
     try:
         pythoncom.CoInitialize()
@@ -179,6 +191,13 @@ def run_qsts(sin_file: str,
     trafo_names = _names(db_file, "TwoWindingTransformer")
     if not load_node:
         raise RuntimeError("no Load elements found in the network")
+
+    # FIX: IDs for the numeric fallback in GetObj
+    load_eids = _elem_ids(db_file, "Load")
+    pv_eids = _elem_ids(db_file, "VarShuntElement")
+    line_eids = _elem_ids(db_file, "Line")
+    trafo_eids = _elem_ids(db_file, "TwoWindingTransformer")
+    node_eids = _node_ids(db_file)
 
     # ---- 2. assign CSVs ---------------------------------------------------------
     files = sorted(glob.glob(os.path.join(csv_dir, "*.csv")))
@@ -263,24 +282,53 @@ def run_qsts(sin_file: str,
         dump_messages()
         raise RuntimeError("LoadDB failed - see messages above")
 
-    def get(kind, name):
+    # FIX: warm-up power flow.  GetObj() only hands back real calculation
+    # objects after the network has been solved at least once.  This dummy
+    # run uses the as-built P/Q from the database; with BatchMode(1) the
+    # results go to the virtual DB, so nothing is written to disk and the
+    # timestep-1 overwrite below simply replaces them.
+    print("[qsts] Warm-up power flow to populate calculation objects...")
+    try:
+        sim.Start(method)
+    except Exception as exc:
+        print(f"[qsts] Warm-up Start raised: {exc}")
+    if sim.StatusID != STATUS_OK:
+        print(f"[qsts] WARNING: warm-up Start not OK "
+              f"(status={sim.StatusID}, {sim.StatusText})")
+        dump_messages()
+        # don't raise - GetObj may still work
+
+    # FIX: get() tries name first, then numeric Element_ID
+    def get(kind, name, eid=None):
         last = None
-        for k in (kind, kind.upper()):
+        variants = [(kind.upper(), name), (kind, name)]
+        if eid is not None:
+            variants += [(kind.upper(), eid), (kind, eid)]
+        for k, ident in variants:
             try:
-                o = sim.GetObj(k, str(name))
+                o = sim.GetObj(k, ident)
                 if o is not None:
                     return o
             except Exception as exc:
                 last = exc
-        print(f"[qsts] GetObj('{kind}', '{name}') failed: {last}")
+        print(f"[qsts] GetObj('{kind}', '{name}') failed.")
+        if last is not None:
+            print(f"       last exception: {last}")
         dump_messages()
         raise RuntimeError(f"{kind} '{name}' not found in the calculation")
 
-    load_obj = {n: get("Load", n) for n in loads}
-    pv_obj = {n: get("VarShuntElement", n) for n in pv_node}
-    node_obj = {n: get("Node", n) for n in node_names}
-    line_obj = {n: get("Line", n) for n in line_names}
-    trafo_obj = {n: get("TwoWindingTransformer", n) for n in trafo_names}
+    load_obj = {n: get("Load", n, load_eids.get(n)) for n in loads}
+    pv_obj = {n: get("VarShuntElement", n, pv_eids.get(n)) for n in pv_node}
+    node_obj = {n: get("Node", n, node_eids.get(n)) for n in node_names}
+    line_obj = {n: get("Line", n, line_eids.get(n)) for n in line_names}
+    trafo_obj = {n: get("TwoWindingTransformer", n, trafo_eids.get(n)) for n in trafo_names}
+
+    def refresh_result_objects():
+        """Re-fetch the handles that carry .Result(...) - in case Start() invalidated them."""
+        node_obj.update({n: get("Node", n, node_eids.get(n)) for n in node_names})
+        line_obj.update({n: get("Line", n, line_eids.get(n)) for n in line_names})
+        trafo_obj.update({n: get("TwoWindingTransformer", n, trafo_eids.get(n))
+                          for n in trafo_names})
 
     # ---- 5. time loop ------------------------------------------------------------------
     T = len(idx)
@@ -293,6 +341,22 @@ def run_qsts(sin_file: str,
     load_p = np.zeros((T, len(loads)))
     pv_p = np.zeros((T, len(pv_node)))
     pv_list = list(pv_node)
+
+    def collect_step(k: int) -> None:
+        for i, n in enumerate(node_names):
+            r = _res(node_obj[n], "ULFNodeResult", 0)
+            if r is not None:
+                for p in (1, 2, 3):
+                    node_v[k, 3 * i + p - 1] = _item(r, f"U{p}_Un") / 100.0
+        for i, n in enumerate(line_names):
+            r = _res(line_obj[n], "ULFBranchResult", 1)
+            if r is not None:
+                line_l[k, i] = _item(r, "Imax_In")
+        for i, n in enumerate(trafo_names):
+            r = _res(trafo_obj[n], "ULFBranchResult", 1)
+            if r is not None:
+                tr_l[k, i] = _item(r, "Imax_In")
+                tr_p[k, i] = _item(r, "P")
 
     t0 = time.time()
     for k, ts in enumerate(idx):
@@ -311,27 +375,27 @@ def run_qsts(sin_file: str,
         for j, pv in enumerate(pv_list):
             pv_p[k, j] = float(pv_obj[pv].Item("Plf"))
 
-        sim.Start(method)
+        # FIX: wrap Start() so one bad timestep doesn't kill the whole run
+        try:
+            sim.Start(method)
+        except Exception as exc:
+            if verbose:
+                print(f"[warn] {ts}: Start raised: {exc}")
+            status[k] = -1
+            continue
         status[k] = sim.StatusID
         if status[k] != STATUS_OK:
             if verbose:
                 print(f"[warn] {ts}: status {status[k]} ({sim.StatusText})")
             continue
 
-        for i, n in enumerate(node_names):
-            r = _res(node_obj[n], "ULFNodeResult", 0)
-            if r is not None:
-                for p in (1, 2, 3):
-                    node_v[k, 3 * i + p - 1] = _item(r, f"U{p}_Un") / 100.0
-        for i, n in enumerate(line_names):
-            r = _res(line_obj[n], "ULFBranchResult", 1)
-            if r is not None:
-                line_l[k, i] = _item(r, "Imax_In")
-        for i, n in enumerate(trafo_names):
-            r = _res(trafo_obj[n], "ULFBranchResult", 1)
-            if r is not None:
-                tr_l[k, i] = _item(r, "Imax_In")
-                tr_p[k, i] = _item(r, "P")
+        collect_step(k)
+
+        # FIX: on iteration 0 only, if nothing came back, refresh handles and retry once.
+        if k == 0 and np.all(np.isnan(node_v[0])):
+            print("[qsts] No node results on first step - refreshing object handles and retrying...")
+            refresh_result_objects()
+            collect_step(0)
 
         if verbose and (k + 1) % 25 == 0:
             print(f"  step {k+1}/{T}  ({(time.time()-t0)/(k+1):.2f} s/step)")
