@@ -816,7 +816,7 @@ class SincalBuilder:
         t.SetValue("Flag_Lf", 1)
         t.SetValue("Flag_ConNode", 1)
         # ---- zero-sequence: Dyn gives Z0 = Z1 (delta provides return path) ----
-        t.SetValue("Flag_Z0Input", 1)       # Z0/Z1 and R0/X0
+        t.SetValue("Flag_Z0_Input", 1)       # Z0/Z1 and R0/X0
         t.SetValue("Z0_Z1", 1.0)
         t.SetValue("R0_X0", 0.1)
         t.Update()
@@ -838,7 +838,7 @@ class SincalBuilder:
         ld.SetValue("Flag_LoadType", 2)      # P, Q constant
         # ---- zero-sequence: grounded load, Z0 = Z1 ----
         ld.SetValue("Flag_Z0", 1)            # fixed grounded
-        ld.SetValue("Flag_Z0Input", 1)      # Z0/Z1 and R0/X0
+        ld.SetValue("Flag_Z0_Input", 1)      # Z0/Z1 and R0/X0
         ld.SetValue("Z0_Z1", 1.0)
         ld.SetValue("R0_X0", 1.0)
         ld.SetValue("P", float(p_mw))
@@ -885,7 +885,7 @@ class SincalBuilder:
         sh.SetValue("Flag_Lf", 1)
         # ---- zero-sequence: grounded shunt, Z0 = Z1 ----
         sh.SetValue("Flag_Z0", 1)
-        sh.SetValue("Flag_Z0Input", 1)
+        sh.SetValue("Flag_Z0_Input", 1)
         sh.SetValue("Z0_Z1", 1.0)
         sh.SetValue("R0_X0", 1.0)
         sh.Update()
@@ -980,7 +980,7 @@ class SincalBuilder:
             if use_varshunt:
                 rows = con.execute(
                     'SELECT e."Name", d."Plf", d."Qlf", d."Ulf", '
-                    'd."Flag_LF", d."Flag_LoadType", d."Flag_Z0Input" '
+                    'd."Flag_LF", d."Flag_LoadType", d."Flag_Z0_Input" '
                     'FROM "VarShuntElement" d '
                     'JOIN "Element" e ON e."Element_ID"=d."Element_ID" '
                     'ORDER BY 1').fetchall()
@@ -1046,7 +1046,7 @@ class SincalBuilder:
         Single-phase PV as a VarShuntElement (boundary injection).
 
         Unlike DCInfeeder, VarShuntElement carries the full zero-sequence model
-        (Flag_Z0Input / Z0_Z1 / R0_X0), so a single-phase terminal does not
+        (Flag_Z0_Input / Z0_Z1 / R0_X0), so a single-phase terminal does not
         make the LF_USYM zero-sequence network singular.  This is what lets
         a residential PV system be modelled on the same phase as the
         residential load.
@@ -1068,7 +1068,7 @@ class SincalBuilder:
         pv.SetValue("Ulf", float(kv_ll))
 
         # --- Zero-sequence data (identical convention to Load) ---
-        pv.SetValue("Flag_Z0Input", 1)           # Z0/Z1 and R0/X0
+        pv.SetValue("Flag_Z0_Input", 1)           # Z0/Z1 and R0/X0
         pv.SetValue("Z0_Z1", 1.0)
         pv.SetValue("R0_X0", 1.0)
         pv.SetValue("Pneg", 0.0)
