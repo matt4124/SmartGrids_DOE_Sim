@@ -244,7 +244,13 @@ def print_network(sin_file: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Changing element parameters (needs PSS-SINCAL + pywin32)
+# Changing element parameters
+#
+# SINCAL's COM object lookups (Simulation.GetObj and DB_EL().GetCommonObject
+# for "Load"/"VarShuntElement") fault with RPC_E_SERVERFAULT on some installs,
+# so parameters are edited directly in the network's SQLite database - the
+# same approach opendss_to_sincal.py uses for terminal phases.  COM is only
+# used to run the calculation (LoadDB + Start), which is known to work.
 # ---------------------------------------------------------------------------
 
 COM_VER = "28"   # PSS-SINCAL 22.5
@@ -268,173 +274,214 @@ def _setparam(obj, name, value):
 
 class SincalNetwork:
     """
-    Read / change parameters of a load or VarShunt (PV) element.
+    Read / change parameters of a load or VarShunt (PV) element, and solve.
 
-    Two modes
-    ---------
-    persist=False (default): changes are made to SINCAL's in-memory
-        calculation objects after LoadDB().  Nothing is written to the
-        file, so this is the mode for QSTS (change values, solve, repeat).
-        Changes are lost on close().
-    persist=True: changes are written to the network database.  Close the
-        network in the SINCAL GUI first (or Reload it afterwards).
+    Edits are written to the network database (<name>_files/database.db), so
+    they persist - run on a copy of the network if you want the base case
+    untouched.  Close the network in the SINCAL GUI first (or Reload it
+    afterwards), otherwise the file may be locked or the GUI out of date.
 
     Example
     -------
-        with SincalNetwork(SIN) as net:
-            print(net.get("load", "LOAD_1", "P", "Q"))
-            net.set_load("LOAD_1", kW=3.2, kvar=0.5)
-            net.set_pv("PV_bus5", kW=4.1)          # 4.1 kW generation
-            net.solve()
+        net = SincalNetwork(SIN)
+        print(net.get("load", "Ld3313_LOAD_A", "P", "Q"))
+        net.set_load("Ld3313_LOAD_A", kW=3.2, kvar=0.5)   # kW consumed
+        net.set_pv("PV_B2656", kW=4.1)                    # kW generated
+        net.solve()                                       # runs LF_USYM
+
+        # QSTS step: many elements in one transaction
+        net.set_powers(loads={"Ld3313_LOAD_A": (1.2, 0.2)},
+                       pvs={"PV_B2656": (2.5, 0.0)})
 
         # raw field names / native units (MW, Mvar, ...):
-        net.set("pv", "PV_bus5", Plf=-0.004, Qlf=0.0)
+        net.set("pv", "PV_B2656", Plf=-0.004, Qlf=0.0)
     """
 
-    def __init__(self, sin_file: str, persist: bool = False,
-                 method: str = "LF_USYM"):
+    def __init__(self, sin_file: str, persist=None, method: str = "LF_USYM"):
+        # 'persist' is accepted for backwards compatibility and ignored:
+        # edits always go to the database now.
         self.sin_file = os.path.abspath(sin_file)
         self.db_file = db_path_from_sin(sin_file)
-        self.persist = persist
         self.method = method
         self.conn = (f"TYP=NET;MODE=SQLITE;FILE={self.db_file};"
                      f"USR=Admin;PWD=;SINFILE={self.sin_file};")
-        self._srv = self._sim = self._db = None
 
-    # -- lifecycle ---------------------------------------------------------
+    # context-manager support (nothing to open/close any more)
     def open(self) -> "SincalNetwork":
-        try:
-            import win32com.client as wc
-        except ImportError:
-            raise ImportError("pywin32 is required: pip install pywin32")
-        self._srv = wc.Dispatch(f"Sincal.SimulationSrv.{COM_VER}")
-        self._sim = self._srv.GetSimulation()
-        self._sim.Database(self.conn)
-        _setparam(self._sim, "IDENTIFICATION", "Name")
-        if self.persist:
-            self._db = self._sim.DB_EL()
-            _setparam(self._db, "DBSYS_MODE", 8)             # SQLite
-            _setparam(self._db, "DBSYS_DATAFILE", self.db_file)
-            _setparam(self._db, "DBSYS_USER", "Admin")
-            _setparam(self._db, "DBSYS_PASSWORD", "")
-            _setparam(self._db, "NameIdentification", "Name")
-            if self._db.OpenEx() != 0:
-                raise RuntimeError("Could not open the network database")
-        else:
-            self._sim.LoadDB(self.method)
-            if self._sim.StatusID != 1500:
-                raise RuntimeError(f"LoadDB failed: {self._sim.StatusText}")
         return self
 
     def close(self) -> None:
-        try:
-            if self._db:
-                self._db.Close()
-        except Exception:
-            pass
-        self._db = self._sim = self._srv = None
+        pass
 
     def __enter__(self):
-        return self.open()
+        return self
 
     def __exit__(self, *exc):
-        self.close()
+        pass
 
-    # -- low-level access --------------------------------------------------
-    def _obj(self, kind: str, name: str):
-        if self._sim is None:
-            raise RuntimeError("Network not open - use 'with SincalNetwork(...)' or .open()")
-        table = _KINDS[kind.lower()][0]
+    # -- low-level SQL -----------------------------------------------------
+    def _connect(self, write: bool = False) -> sqlite3.Connection:
+        if write:
+            return sqlite3.connect(self.db_file, timeout=10)
+        return sqlite3.connect(f"file:{self.db_file}?mode=ro", uri=True, timeout=10)
+
+    @staticmethod
+    def _columns(con, table: str) -> dict:
+        return {r[1].lower(): r[1] for r in con.execute(f'PRAGMA table_info("{table}")')}
+
+    def _name_hint(self, kind: str) -> str:
         try:
-            if self.persist:
-                obj = self._db.GetCommonObject(table, name)
+            rows = list_loads(self.sin_file) if kind.lower() == "load" \
+                else list_pv(self.sin_file)
+            rows = rows.to_dict("records") if hasattr(rows, "to_dict") else rows
+            return (f"Available {kind} names include: "
+                    f"{', '.join(r['name'] for r in rows[:5])} ...")
+        except Exception:
+            return ""
+
+    def _element_id(self, con, kind: str, name: str) -> int:
+        table = _KINDS[kind.lower()][0]
+        row = con.execute(
+            f'SELECT e.Element_ID FROM Element e JOIN "{table}" x '
+            'ON x.Element_ID = e.Element_ID '
+            'WHERE e.Name = ? AND e.Flag_Variant = 1 AND x.Flag_Variant = 1',
+            (name,)).fetchone()
+        if row is None:
+            raise KeyError(f"{kind} '{name}' not found. {self._name_hint(kind)}")
+        return int(row[0])
+
+    def _real_fields(self, con, table: str, fields) -> dict:
+        """Map requested field names to the real column names (case-insensitive)."""
+        cols = self._columns(con, table)
+        out, bad = {}, []
+        for f in fields:
+            real = cols.get(f.lower())
+            if real is None:
+                bad.append(f)
             else:
-                obj = self._sim.GetObj(table, name)
-        except Exception as exc:
-            raise KeyError(f"{kind} '{name}' not found ({exc})") from None
-        if obj is None:
-            raise KeyError(f"{kind} '{name}' not found")
-        return obj
-
-    def _read(self, obj, field: str):
-        return obj.GetValue(field) if self.persist else obj.Item(field)
-
-    def _write(self, obj, field: str, value) -> None:
-        if self.persist:
-            obj.SetValue(field, value)
-        else:
-            obj.SetItem(field, value)
+                out[f] = real
+        if bad:
+            raise KeyError(f"'{table}' has no field(s) {bad}. Columns: "
+                           f"{', '.join(sorted(cols.values()))}")
+        return out
 
     # -- public API --------------------------------------------------------
     def get(self, kind: str, name: str, *fields: str) -> dict:
-        """Read raw fields (native units) of a 'load' or 'pv' element."""
-        obj = self._obj(kind, name)
-        return {f: self._read(obj, f) for f in fields}
+        """Read raw fields (native units, e.g. P in MW) of a 'load' or 'pv'."""
+        table = _KINDS[kind.lower()][0]
+        con = self._connect()
+        try:
+            eid = self._element_id(con, kind, name)
+            real = self._real_fields(con, table, fields)
+            cols = ", ".join(f'"{real[f]}"' for f in fields)
+            row = con.execute(
+                f'SELECT {cols} FROM "{table}" WHERE Element_ID = ? AND Flag_Variant = 1',
+                (eid,)).fetchone()
+        finally:
+            con.close()
+        return dict(zip(fields, row))
 
     def set(self, kind: str, name: str, **values) -> dict:
-        """
-        Set raw fields (native units, e.g. P in MW) and verify by reading back.
-        SINCAL silently ignores unknown field names, so a mismatch raises.
-        """
-        obj = self._obj(kind, name)
-        for f, v in values.items():
-            self._write(obj, f, v)
-        if self.persist:
-            obj.Update()
-        result = {f: self._read(obj, f) for f in values}
-        bad = []
-        for f, want in values.items():
-            got = result[f]
-            try:
-                ok = math.isclose(float(got), float(want), rel_tol=1e-6, abs_tol=1e-9)
-            except (TypeError, ValueError):
-                ok = (got == want)
-            if not ok:
-                bad.append(f"{f}: wrote {want}, read back {got}")
-        if bad:
-            raise RuntimeError(f"{kind} '{name}' did not accept: " + "; ".join(bad)
-                               + "  (check the field name)")
-        return result
+        """Set raw fields (native units) and verify by reading them back."""
+        return self._set_many([(kind, name, values)])[0]
 
-    def _power(self, kind, name, kW, kvar):
+    def _set_many(self, updates) -> list:
+        """updates: list of (kind, name, {field: value}); one transaction."""
+        con = self._connect(write=True)
+        results = []
+        try:
+            for kind, name, values in updates:
+                table = _KINDS[kind.lower()][0]
+                eid = self._element_id(con, kind, name)
+                real = self._real_fields(con, table, values)
+                sets = ", ".join(f'"{real[f]}" = ?' for f in values)
+                con.execute(
+                    f'UPDATE "{table}" SET {sets} WHERE Element_ID = ? AND Flag_Variant = 1',
+                    (*values.values(), eid))
+                cols = ", ".join(f'"{real[f]}"' for f in values)
+                row = con.execute(
+                    f'SELECT {cols} FROM "{table}" WHERE Element_ID = ? AND Flag_Variant = 1',
+                    (eid,)).fetchone()
+                got = dict(zip(values, row))
+                for f, want in values.items():
+                    if not math.isclose(float(got[f]), float(want),
+                                        rel_tol=1e-9, abs_tol=1e-12):
+                        raise RuntimeError(f"{kind} '{name}': {f} wrote {want}, "
+                                           f"read back {got[f]}")
+                results.append(got)
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+        return results
+
+    def _power_values(self, kind: str, kW, kvar) -> dict:
         _, pf, qf, sign = _KINDS[kind]
         vals = {}
         if kW is not None:
             vals[pf] = sign * kW / 1000.0
         if kvar is not None:
             vals[qf] = sign * kvar / 1000.0
-        return self.set(kind, name, **vals)
+        return vals
 
     def set_load(self, name: str, kW: float | None = None,
                  kvar: float | None = None) -> dict:
         """Set a load's active/reactive power (kW / kvar consumed)."""
-        obj = self._obj("load", name)
-        fmt = None
-        for f in ("Flag_Lf", "Flag_LF"):
-            try:
-                fmt = self._read(obj, f)
-                break
-            except Exception:
-                continue
-        if fmt is not None and int(fmt) != 1:
-            raise ValueError(
-                f"Load '{name}' uses input format {fmt}, not 'P and Q' (1); "
-                "set its per-phase fields with .set('load', name, P1=..., Q1=...)")
-        return self._power("load", name, kW, kvar)
+        self._check_load_format(name)
+        return self.set("load", name, **self._power_values("load", kW, kvar))
 
     def set_pv(self, name: str, kW: float | None = None,
                kvar: float | None = None) -> dict:
         """Set a PV VarShunt's output (kW / kvar *generated*, positive = injecting)."""
-        return self._power("pv", name, kW, kvar)
+        return self.set("pv", name, **self._power_values("pv", kW, kvar))
 
-    def solve(self, method: str | None = None) -> bool:
-        """Run a calculation on the in-memory model (persist=False only)."""
-        if self.persist:
-            raise RuntimeError("solve() needs persist=False (in-memory mode)")
-        self._sim.Start(method or self.method)
-        ok = self._sim.StatusID == 1101
-        if not ok:
-            print(f"Calculation failed: {self._sim.StatusText}")
+    def set_powers(self, loads: dict | None = None, pvs: dict | None = None) -> None:
+        """
+        Set many elements in one transaction (one QSTS time step).
+        loads: {name: (kW, kvar)}   pvs: {name: (kW generated, kvar generated)}
+        """
+        ups = []
+        for name, (kw, kvar) in (loads or {}).items():
+            self._check_load_format(name)
+            ups.append(("load", name, self._power_values("load", kw, kvar)))
+        for name, (kw, kvar) in (pvs or {}).items():
+            ups.append(("pv", name, self._power_values("pv", kw, kvar)))
+        self._set_many(ups)
+
+    def _check_load_format(self, name: str) -> None:
+        fmt = self.get("load", name, "Flag_Lf")["Flag_Lf"]
+        if fmt is not None and int(fmt) != 1:
+            raise ValueError(
+                f"Load '{name}' uses input format {fmt}, not 'P and Q' (1); "
+                "set its per-phase fields with .set('load', name, P1=..., Q1=...)")
+
+    def solve(self, method: str | None = None, verbose: bool = True) -> bool:
+        """Run a calculation on the database in a fresh SINCAL simulation."""
+        try:
+            import win32com.client as wc
+        except ImportError:
+            raise ImportError("pywin32 is required: pip install pywin32")
+        method = method or self.method
+        srv = sim = None
+        try:
+            srv = wc.Dispatch(f"Sincal.SimulationSrv.{COM_VER}")
+            sim = srv.GetSimulation()
+            sim.Database(self.conn)
+            _setparam(sim, "IDENTIFICATION", "Name")
+            sim.LoadDB(method)
+            sim.Start(method)
+            ok = sim.StatusID == 1101
+            if not ok and verbose:
+                print(f"Calculation failed: {sim.StatusText}")
+                kinds = {1: "STATUS", 2: "INFO", 3: "WARNING", 4: "ERROR", 6: "TASK"}
+                msgs = sim.Messages
+                for i in range(1, msgs.Count + 1):
+                    m = msgs.Item(i)
+                    print(f"  [{kinds.get(m.Type, m.Type):>7}] {m.MessageId:>6}  {m.Text}")
+        finally:
+            sim = srv = None
         return ok
 
 
