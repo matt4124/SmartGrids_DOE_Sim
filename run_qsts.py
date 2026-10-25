@@ -664,10 +664,14 @@ def read_node_voltages(sin_file: str):
     import pandas as pd
     con = sqlite3.connect(f"file:{db_path_from_sin(sin_file)}?mode=ro", uri=True)
     try:
+        have = {r[1].lower() for r in con.execute('PRAGMA table_info("ULFNodeResult")')}
+        extra = "".join(f", r.{c} AS {a}" for c, a in (
+            ("Fkt_Sym", "VUF_sincal_pct"), ("phi1", "ang1_deg"),
+            ("phi2", "ang2_deg"), ("phi3", "ang3_deg")) if c.lower() in have)
         df = pd.read_sql_query(
             "SELECT n.Name AS node, r.Flag_Phase AS phase, "
             "r.U1_Un, r.U2_Un, r.U3_Un, r.U1 AS U1_kV, r.U2 AS U2_kV, r.U3 AS U3_kV, "
-            "r.Result_ID "
+            "r.Result_ID" + extra + " "
             "FROM ULFNodeResult r JOIN Node n ON n.Node_ID = r.Node_ID "
             "ORDER BY r.Result_ID", con)
         # Result_ID is a per-row key, not a per-run id: keep the newest row
