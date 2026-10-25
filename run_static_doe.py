@@ -197,6 +197,25 @@ def read_network_info(sin_file: str, line_rating_a=None) -> NetworkInfo:
     return NetworkInfo(source, edges, ratings, sn, subtree, edge_child)
 
 
+def set_converter_control(sin_file: str, enabled: bool) -> int:
+    """
+    Switch the converters' built-in volt-watt / volt-var control off (enabled=False)
+    so they inject exactly the P (and Q) the DOE sets.  Returns converters changed.
+    """
+    if enabled:
+        return 0
+    con = sqlite3.connect(db_path_from_sin(sin_file))
+    try:
+        cur = con.execute('UPDATE "DCInfeeder" SET "Flag_Pctrl"=0, "Flag_Qctrl"=0, "Q"=0 '
+                          'WHERE "Flag_Variant"=1')
+        con.commit()
+        return cur.rowcount
+    except sqlite3.Error:
+        return 0
+    finally:
+        con.close()
+
+
 def set_source_voltage(sin_file: str, pu: float) -> None:
     """Set every network feeder's voltage (Infeeder.u, in % of nominal)."""
     con = sqlite3.connect(db_path_from_sin(sin_file))
@@ -326,6 +345,10 @@ def evaluate_network(nodes: pd.DataFrame, flows: pd.DataFrame, info: NetworkInfo
         tx = f[f["element"].isin(info.trafo_sn_kva)].copy()
         if len(tx):
             tx["load"] = 100.0 * tx["S_kVA"].abs() / tx["element"].map(info.trafo_sn_kva)
+            # SINCAL's own loading is current based (I / In per phase); with single-phase
+            # PV/loads one phase can be overloaded while total S looks fine, so take the worse.
+            if "loading_pct" in tx.columns:
+                tx["load"] = np.fmax(tx["load"], tx["loading_pct"].abs())
             worst = tx.groupby("element")["load"].max()
             metrics["max_trafo_loading_pct"] = float(worst.max())
             if cons.trafo_loading_max_pct is not None:
@@ -360,8 +383,29 @@ class StaticDOE:
         ld = list_loads(sin_file)
         ld = ld if hasattr(ld, "columns") else pd.DataFrame(ld)
         self.loads_at = ld.groupby("node")["name"].apply(list).to_dict()
-        self.cap = {g: float(max_export_kw.get(g, 5.0) if isinstance(max_export_kw, dict)
-                             else max_export_kw) for g in self.gens}
+        # inverter ratings (converter Pmax, kW): SINCAL clamps P above this
+        self.rating = {}
+        try:
+            con = _ro(sin_file)
+            for nm, pmax in con.execute(
+                    "SELECT e.Name, c.Pmax FROM DCInfeeder c JOIN Element e "
+                    "ON e.Element_ID=c.Element_ID AND e.Flag_Variant=1 WHERE c.Flag_Variant=1"):
+                if pmax and pmax > 0:
+                    self.rating[nm] = pmax * 1000.0
+            con.close()
+        except sqlite3.Error:
+            pass
+        self.notes0 = []
+        self.cap = {}
+        for g in self.gens:
+            user = (max_export_kw.get(g) if isinstance(max_export_kw, dict) else max_export_kw)
+            rated = self.rating.get(g)
+            cap = float(user) if user is not None else (rated if rated else 5.0)
+            if rated and cap > rated + 1e-9:
+                self.notes0.append(f"{g}: cap {cap:g} kW lowered to the converter's Pmax "
+                                   f"{rated:g} kW (SINCAL clamps P above Pmax)")
+                cap = rated
+            self.cap[g] = cap
 
     # -- one steady-state run -------------------------------------------------
     def _simulate(self, loads: dict, pvs: dict):
@@ -389,27 +433,46 @@ class StaticDOE:
                 all_v.append(Violation("no_convergence", sname, np.nan, None, frozenset(self.gens)))
                 continue
             m, v = evaluate_network(nodes, flows, self.info, self.cons, self.gen_node, self.vuf_source)
-            rows.append(dict(scenario=sname, converged=True, **m))
+            # does the simulated net export actually reach the transformer?
+            dp = np.nan
+            tx = flows[flows["element"].isin(self.info.trafo_sn_kva)] if len(flows) else flows
+            if len(tx) and "P_kW" in tx:
+                sp = self._pv_setpoints(limits, loads)
+                expected = sum(g for g, _ in sp.values()) - sum(kw for kw, _ in loads.values())
+                if abs(expected) > 1.0:
+                    dp = 100.0 * float(tx["P_kW"].abs().max()) / abs(expected)
+            rows.append(dict(scenario=sname, converged=True, delivered_pct=dp, **m))
             all_v += v
         return all_v, rows
 
     # -- search --------------------------------------------------------------
     def run(self) -> DOEResult:
         say = print if self.verbose else (lambda *a, **k: None)
-        notes = []
+        notes = list(self.notes0[:3])
+        if len(self.notes0) > 3:
+            notes.append(f"... and {len(self.notes0) - 3} more generators capped at their Pmax")
 
         # baseline: violations that exist with every PV off are not the PV's fault
         zero = {g: 0.0 for g in self.gens}
         base_v, _ = self.evaluate(zero)
-        baseline = {v.key for v in base_v}
+        base = {v.key: v for v in base_v}
+        baseline = set(base)
         if baseline:
-            notes.append(f"{len(baseline)} constraint(s) already violated with PV off and ignored: "
-                         + ", ".join(f"{k}@{w}" for k, w in sorted(baseline)[:6]))
+            notes.append(f"{len(baseline)} constraint(s) already violated with PV off (they only "
+                         "count again if PV makes them worse): "
+                         + ", ".join(f"{k}@{w}={base[(k, w)].value:.3g}" for k, w in sorted(baseline)[:6]))
         if any(k == "no_convergence" for k, _ in baseline):
             raise RuntimeError("power flow does not converge even with all PV at 0 kW")
 
+        margin = dict(v_max=0.002, v_min=0.002, vuf=0.1, line_loading=1.0, trafo_loading=1.0)
+
+        def worse(v):
+            b = base[v.key].value
+            m = margin.get(v.kind, 0.0)
+            return v.value < b - m if v.kind == "v_min" else v.value > b + m
+
         def real(viol):
-            return [v for v in viol if v.key not in baseline]
+            return [v for v in viol if v.key not in base or worse(v)]
 
         start = {g: min(self.start_kw, self.cap[g]) for g in self.gens}
         v0, rows0 = self.evaluate(start)
@@ -447,14 +510,14 @@ class StaticDOE:
             viol = real(viol)
             kinds = sorted({v.kind for v in viol})
             rdf = pd.DataFrame(rows).reindex(columns=["max_v_pu", "min_v_pu", "max_vuf_pct",
-                                                     "max_line_loading_pct", "max_trafo_loading_pct"])
+                                                     "max_line_loading_pct", "max_trafo_loading_pct", "delivered_pct"])
             hist.append(dict(iteration=it, accepted=not viol, n_violations=len(viol),
                              violated=",".join(kinds), n_active=len(active),
                              total_limit_kW=sum(trial.values()),
                              **{k: rdf[k].max() for k in ("max_v_pu", "max_vuf_pct",
                                                           "max_line_loading_pct",
                                                           "max_trafo_loading_pct")},
-                             min_v_pu=rdf["min_v_pu"].min()))
+                             min_v_pu=rdf["min_v_pu"].min(), delivered_pct=rdf["delivered_pct"].min()))
             trials.append({"iteration": it, **trial})
             if not viol:
                 best, best_rows = trial, rows
@@ -487,18 +550,28 @@ class StaticDOE:
             notes.append(f"min_export_kw={self.min_export} raises some limits above the "
                          "verified level (guaranteed minimum, not network-verified)")
         final = pd.DataFrame(best_rows)
+        if "delivered_pct" in final:
+            dpv = final["delivered_pct"].dropna()
+            if len(dpv) and ((dpv < 90.0) | (dpv > 110.0)).any():
+                bad = dpv[(dpv < 90.0) | (dpv > 110.0)].iloc[0]
+                notes.append(
+                    f"WARNING: the transformer carries {bad:.0f} % of the export the search "
+                    "set (expected ~100 %). SINCAL is not applying the setpoints as given "
+                    "(inverter Pmax clamp, converter controls, or other injections), so the "
+                    "limits are NOT verified. Check the converter settings.")
         return DOEResult(lim, pd.DataFrame(hist), pd.DataFrame(trials), final,
                          sorted(baseline), converged, it, notes)
 
 
 def compute_static_doe(sin_file: str, constraints: Constraints | None = None, *,
                        scenarios=None, profile_folder=None, mapping=None,
-                       max_export_kw=5.0, min_export_kw: float = 0.0,
+                       max_export_kw=None, min_export_kw: float = 0.0,
                        start_kw: float = 0.5, initial_step_kw: float = 1.0,
                        min_step_kw: float = 0.05, max_iterations: int = 80,
                        limit_on: str = "net_export", pv_kvar_per_kw: float = 0.0,
                        line_rating_a=None, source_voltage_pu: float | None = None,
-                       vuf_source: str = "auto", verbose: bool = True) -> DOEResult:
+                       vuf_source: str = "auto", converter_control: str = "off",
+                       verbose: bool = True) -> DOEResult:
     """
     Compute static export limits for every PV in the network.
 
@@ -506,7 +579,8 @@ def compute_static_doe(sin_file: str, constraints: Constraints | None = None, *,
     scenarios        list[LoadScenario]; default [ZERO_LOAD].  The result satisfies
                      the constraints in EVERY scenario (the most restrictive wins).
     profile_folder, mapping   only for scenarios with profile_pct
-    max_export_kw    cap per generator (float, or {pv name: kW})
+    max_export_kw    cap per generator (float, or {pv name: kW}).  Default: each
+                     converter's own Pmax, else 5 kW.  Never above the converter's Pmax.
     min_export_kw    guaranteed floor reported in the limits (not network-verified)
     start_kw         starting level for every PV (must be safely feasible)
     initial_step_kw, min_step_kw   per-generator step; halves when blamed
@@ -515,14 +589,24 @@ def compute_static_doe(sin_file: str, constraints: Constraints | None = None, *,
     line_rating_a    float or {line: A} to override/supply line ratings
     source_voltage_pu  set the MV feeder voltage (e.g. 1.03) before the search
     vuf_source       "auto" (compute from angles, else SINCAL) | "sincal"
+    converter_control  "off" (default): switch the converters' volt-watt / volt-var
+                     control off so each PV injects exactly the setpoint (+ the Q from
+                     pv_kvar_per_kw);  "as_built": leave the controllers as built.
+                     "off" is written to the database.
     """
     if limit_on not in ("net_export", "generation"):
         raise ValueError("limit_on must be 'net_export' or 'generation'")
     cons = constraints or Constraints()
     scenarios = scenarios or [ZERO_LOAD]
     scen_loads = resolve_load_scenarios(sin_file, scenarios, profile_folder, mapping)
+    pre_notes = []
     if source_voltage_pu is not None:
         set_source_voltage(sin_file, source_voltage_pu)
+    if converter_control not in ("off", "as_built"):
+        raise ValueError("converter_control must be 'off' or 'as_built'")
+    n_off = set_converter_control(sin_file, converter_control == "as_built")
+    if n_off:
+        pre_notes.append(f"volt-watt / volt-var control switched off on {n_off} converter(s)")
     doe = StaticDOE(sin_file, cons, scen_loads, max_export_kw, min_export_kw, start_kw,
                     initial_step_kw, min_step_kw, max_iterations, limit_on,
                     pv_kvar_per_kw, line_rating_a, vuf_source, verbose)
@@ -530,4 +614,6 @@ def compute_static_doe(sin_file: str, constraints: Constraints | None = None, *,
         raise ValueError("no line ratings available: rebuild the network with the updated "
                          "converter (reads normamps), pass line_rating_a=..., or set "
                          "line_loading_max_pct=None")
-    return doe.run()
+    res = doe.run()
+    res.notes = pre_notes + res.notes
+    return res

@@ -488,6 +488,10 @@ class SincalNetwork:
         vals = {}
         if kW is not None:
             vals[pf] = sign * kW / 1000.0
+            if kind == "converter":
+                # A PV converter (Flag_DCtyp 7) takes its load-flow output from the DC
+                # power (x fDC_power x efficiency), not from P, so write both.
+                vals["DC_power"] = kW / 1000.0
         if kvar is not None:
             vals[qf] = sign * kvar / 1000.0
         return vals
