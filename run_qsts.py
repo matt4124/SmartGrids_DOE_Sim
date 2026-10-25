@@ -457,8 +457,36 @@ class SincalNetwork:
                 f"Load '{name}' uses input format {fmt}, not 'P and Q' (1); "
                 "set its per-phase fields with .set('load', name, P1=..., Q1=...)")
 
-    def solve(self, method: str | None = None, verbose: bool = True) -> bool:
-        """Run a calculation on the database in a fresh SINCAL simulation."""
+    def _msg_objects(self, m) -> str:
+        """' -> Name(ID), ...' for the network elements a message refers to."""
+        try:
+            n = int(m.CountObjectIds)
+            if n <= 0:
+                return ""
+            ids = [int(m.ObjectIdAt(i)) for i in range(1, n + 1)]
+        except Exception:
+            return ""
+        names = {}
+        try:
+            con = self._connect()
+            q = ",".join("?" * len(ids))
+            names = dict(con.execute(
+                f"SELECT Element_ID, Name FROM Element WHERE Flag_Variant=1 "
+                f"AND Element_ID IN ({q})", ids).fetchall())
+            con.close()
+        except Exception:
+            pass
+        return "  -> " + ", ".join(f"{names.get(i, '?')}({i})" for i in ids[:12]) \
+            + (" ..." if len(ids) > 12 else "")
+
+    def solve(self, method: str | None = None, verbose: bool = True,
+              save_results: bool = True, show_messages: bool = False) -> bool:
+        """
+        Run a calculation on the database in a fresh SINCAL simulation.
+        save_results=True runs in batch mode (virtual database) and then calls
+        SaveDB so the results are written into the .sin database, where
+        read_node_voltages() picks them up.
+        """
         try:
             import win32com.client as wc
         except ImportError:
@@ -468,21 +496,175 @@ class SincalNetwork:
         try:
             srv = wc.Dispatch(f"Sincal.SimulationSrv.{COM_VER}")
             sim = srv.GetSimulation()
+            if save_results:
+                sim.BatchMode(1)       # load from real db, results to virtual db
             sim.Database(self.conn)
             _setparam(sim, "IDENTIFICATION", "Name")
             sim.LoadDB(method)
             sim.Start(method)
             ok = sim.StatusID == 1101
-            if not ok and verbose:
-                print(f"Calculation failed: {sim.StatusText}")
+            if ok and save_results:
+                sim.SaveDB(method)     # virtual results -> physical database
+                ok = sim.StatusID == 1500
+                if not ok and verbose:
+                    print(f"SaveDB failed: {sim.StatusID} {sim.StatusText}")
+            if (not ok and verbose) or show_messages:
+                if not ok:
+                    print(f"Calculation failed: {sim.StatusText}")
                 kinds = {1: "STATUS", 2: "INFO", 3: "WARNING", 4: "ERROR", 6: "TASK"}
                 msgs = sim.Messages
                 for i in range(1, msgs.Count + 1):
                     m = msgs.Item(i)
-                    print(f"  [{kinds.get(m.Type, m.Type):>7}] {m.MessageId:>6}  {m.Text}")
+                    print(f"  [{kinds.get(m.Type, m.Type):>7}] {m.MessageId:>6}  {m.Text}"
+                          + self._msg_objects(m))
         finally:
             sim = srv = None
         return ok
+
+
+# ---------------------------------------------------------------------------
+# Profiles and the QSTS loop
+# ---------------------------------------------------------------------------
+
+def load_profiles(folder: str, include: tuple = ("demand",)) -> dict:
+    """
+    Read every household CSV in `folder` -> {household: DataFrame[kW_load, kW_pv]}
+    indexed by interval_start.  Input columns: interval_start, demand, solar
+    (negative = generation), hot_water, air_con (all kW).
+
+    kW_load = sum of the columns named in `include` (default just 'demand'; use
+              include=("demand","hot_water","air_con") if those are separate
+              from 'demand' in your data).
+    kW_pv   = -solar, so generation is positive.
+    """
+    import glob
+    import pandas as pd
+    profiles = {}
+    for path in sorted(glob.glob(os.path.join(folder, "*.csv"))):
+        df = pd.read_csv(path, parse_dates=["interval_start"], index_col="interval_start")
+        df = df[~df.index.duplicated()].sort_index()
+        profiles[os.path.splitext(os.path.basename(path))[0]] = pd.DataFrame({
+            "kW_load": df[list(include)].sum(axis=1, min_count=1),
+            "kW_pv": -df["solar"],
+        })
+    if not profiles:
+        raise FileNotFoundError(f"no .csv files in {folder}")
+    return profiles
+
+
+def assign_profiles(sin_file: str, profiles: dict, mapping: dict | None = None) -> dict:
+    """
+    Pair each load in the network with a household profile.
+    Returns {load_name: household}.  `mapping` ({load_name: household}) wins;
+    any other load gets the next unused profile, in sorted order.  Each
+    household's PV goes to the PV element on that load's node.
+    """
+    loads = list_loads(sin_file)
+    names = [r["name"] for r in (loads.to_dict("records") if hasattr(loads, "to_dict") else loads)]
+    out = dict(mapping or {})
+    unused = [h for h in sorted(profiles) if h not in out.values()]
+    for n in names:
+        if n not in out:
+            if not unused:
+                raise ValueError(f"{len(names)} loads but only {len(profiles)} profiles; "
+                                 "supply fewer loads or more CSVs")
+            out[n] = unused.pop(0)
+    missing = [h for h in out.values() if h not in profiles]
+    if missing:
+        raise KeyError(f"unknown household(s) in mapping: {missing}")
+    return out
+
+
+def common_index(profiles: dict, households) -> "pd.DatetimeIndex":
+    """Timestamps present (non-NaN) in every one of the given households' profiles."""
+    idx = None
+    for h in households:
+        ok = profiles[h].dropna().index
+        idx = ok if idx is None else idx.intersection(ok)
+    return idx
+
+
+def read_node_voltages(sin_file: str):
+    """
+    Latest unbalanced-load-flow node results: DataFrame with node, phase and
+    U1/U2/U3 as % of rated (V/Vn) plus kV.  Empty if no results are stored.
+    """
+    import pandas as pd
+    con = sqlite3.connect(f"file:{db_path_from_sin(sin_file)}?mode=ro", uri=True)
+    try:
+        df = pd.read_sql_query(
+            "SELECT n.Name AS node, r.Flag_Phase AS phase, "
+            "r.U1_Un, r.U2_Un, r.U3_Un, r.U1 AS U1_kV, r.U2 AS U2_kV, r.U3 AS U3_kV, "
+            "r.Result_ID "
+            "FROM ULFNodeResult r JOIN Node n ON n.Node_ID = r.Node_ID "
+            "ORDER BY r.Result_ID", con)
+        # Result_ID is a per-row key, not a per-run id: keep the newest row
+        # for each node/phase in case old results are not overwritten.
+        return df.drop_duplicates(["node", "phase"], keep="last").reset_index(drop=True)
+    finally:
+        con.close()
+
+
+def run_qsts(sin_file: str, profile_folder: str, start=None, end=None, step: int = 1,
+             mapping: dict | None = None, include: tuple = ("demand",),
+             power_factor: float = 1.0, verbose: bool = True):
+    """
+    Quasi-static time series: for each time step set every load and PV from the
+    profiles, solve, and record node voltages.
+
+    start/end : optional timestamps (strings ok) clipping the common period
+    step      : use every n-th profile interval (5-min data, step=6 -> 30 min)
+    mapping   : {load_name: household} overrides; others are auto-assigned
+    power_factor : loads and PV kvar = kW*tan(acos(pf)); 1.0 -> kvar 0 (the CSVs have kW only)
+
+    Returns a long DataFrame: time, node, phase, U1_Un, U2_Un, U3_Un, ...
+    Only intervals where every assigned household has data are run.
+    """
+    import pandas as pd
+    net = SincalNetwork(sin_file)
+    profiles = load_profiles(profile_folder, include)
+    assign = assign_profiles(sin_file, profiles, mapping)
+
+    loads = list_loads(sin_file)
+    loads = loads.to_dict("records") if hasattr(loads, "to_dict") else loads
+    pvs = list_pv(sin_file)
+    pvs = pvs.to_dict("records") if hasattr(pvs, "to_dict") else pvs
+    pv_at_node = {p["node"]: p["name"] for p in pvs}
+    pairs = [(l["name"], pv_at_node.get(l["node"]), assign[l["name"]]) for l in loads]
+
+    idx = common_index(profiles, {h for _, _, h in pairs})
+    if start is not None:
+        idx = idx[idx >= pd.Timestamp(start)]
+    if end is not None:
+        idx = idx[idx <= pd.Timestamp(end)]
+    idx = idx[::step]
+    if len(idx) == 0:
+        raise ValueError("no common timestamps across the assigned households")
+    if verbose:
+        print(f"{len(pairs)} households, {len(idx)} steps: {idx[0]} -> {idx[-1]}")
+
+    tanphi = math.tan(math.acos(power_factor))
+    frames = []
+    for i, t in enumerate(idx):
+        ld, pv = {}, {}
+        for lname, pname, h in pairs:
+            row = profiles[h].loc[t]
+            ld[lname] = (row.kW_load, row.kW_load * tanphi)
+            if pname:
+                pv[pname] = (max(row.kW_pv, 0.0), max(row.kW_pv, 0.0) * tanphi)
+        net.set_powers(loads=ld, pvs=pv)
+        if not net.solve(verbose=verbose):
+            print(f"  step {i} ({t}): no convergence / calc failed, skipped")
+            continue
+        v = read_node_voltages(sin_file)
+        if v.empty:
+            raise RuntimeError("solve succeeded but ULFNodeResult is empty - "
+                               "results are not stored in the database")
+        v.insert(0, "time", t)
+        frames.append(v.drop(columns="Result_ID"))
+        if verbose and (i + 1) % 10 == 0:
+            print(f"  {i + 1}/{len(idx)}")
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 if __name__ == "__main__":
