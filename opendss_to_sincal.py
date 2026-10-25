@@ -10,7 +10,8 @@ Usage
     python opendss_to_sincal.py <Master.dss> [--outdir DIR] [--name NAME] [--no-graphics]
                                 [--pv-pct PCT] [--pv-seed N] [--pv-kva-list 3,5,6.6]
                                 [--pv-kwp-ratio R] [--pv-output PU] [--pv-all-lv-buses]
-                                [--pv-region A|B|C] [--pv-element varshunt|dcinfeeder]
+                                [--pv-region A] [--pv-element varshunt|converter]
+                                [--source-sk-mva MVA]
                                 [--balanced]
                                 [--merge-closed-switches | --no-merge-closed-switches]
 
@@ -24,27 +25,45 @@ the unbalanced power flow (LF_USYM).  ``--balanced`` restores the old behaviour.
 
 Zero-sequence data
 ------------------
-Every element that supports a zero-sequence model (Line, TwoWindingTransformer,
-Infeeder, Load, ShuntImpedance, VarShuntElement) is given a realistic Z0.
-Without this, the unbalanced power flow (LF_USYM) aborts with
-"Voltage is going up - please check zero sequence data" because the
-zero-sequence network is a short-circuit.
+LF_USYM needs a zero-sequence model on every element, otherwise elements are
+reported "partially isolated (zero system)" (messages 1057 / 1045) and left
+out of the calculation: the solve succeeds, but they have no effect.
+
+Realistic residential LV values are applied (defaults at the top of the file):
+  Lines        r0 / x0 from the linecode (Kron-reduced neutral); if absent,
+               Z0 = 4 R1 + j 3 X1 (four-core LV cable).  Closed switches are
+               1 m of cable (not a SINCAL "connector", which is open in the
+               zero system).
+  Transformer  Dyn11, uk 4.5 %, ur from the .dss %r (else 1.0 %), i0 0.3 %,
+               Z0/Z1 = 0.95 (delta winding), R0/X0 from ur and uk.
+  Network feeder  Sk'' 250 MVA (--source-sk-mva), R/X 0.1, solidly grounded,
+               Z0 = Z1.
+  Loads        Grounded wye, Z0 = Z1, R0/X0 from the load's own P/Q
+               (pf 0.95 if the .dss gives neither kvar nor pf).
+  PV shunt     Same convention as the load.
+
+Every value is written under its real database column name (SINCAL silently
+ignores wrong names such as "R"/"Len" on Line, whose columns are r/l) and is
+re-checked and, if needed, corrected directly in the database after the
+build ("Field check" in the log).  After the solve, any element SINCAL left
+out of the power flow is listed.
 
 PV option
 ---------
-``--pv-pct 40`` puts a rooftop-PV converter at a random 40 % of the customer
-buses (buses carrying a load).
+``--pv-pct 40`` puts rooftop PV at a random 40 % of the customer buses
+(buses carrying a load); ``--pv-pct 100`` gives every load a PV system.
 
-By default PV is modelled as a **VarShuntElement** with a constant P/Q
-injection at unity power factor.  This is the only element type in the SINCAL
-database that supports a single-phase terminal together with a full
-zero-sequence model, so it is what allows LF_USYM to converge when the PV
-sits on the same phase as the residential load.
+``--pv-element varshunt`` (default): VarShuntElement, constant P/Q at unity
+power factor.  It supports a single-phase terminal together with a
+zero-sequence model, so LF_USYM handles it on the household's own phase.
 
-``--pv-element dcinfeeder`` switches to the older DCInfeeder model with the
-AS/NZS 4777.2:2020 volt-var and volt-watt controllers.  It has **no**
-zero-sequence fields, so it can only be used for balanced three-phase
-terminals; the unbalanced solver will diverge otherwise.
+``--pv-element converter`` (alias ``dcinfeeder``): a SINCAL Converter set to
+plant type Photovoltaic - inverter rating (--pv-kva-list), array size
+(--pv-kwp-ratio, default 1.3 DC/AC), Umin/Umax 80/115 %, P and Q limits,
+fault contribution 1.1 x rated current, and the AS/NZS 4777.2:2020 volt-var
+and volt-watt characteristics.  The converter has no zero-sequence fields,
+so check the post-build message list: if SINCAL reports it "not considered in
+simulation" on a single-phase terminal, use the varshunt option.
 
 Requires: Python 3.10+, pywin32, PSS-SINCAL V22.5 installed (COM version 28).
 """
@@ -122,7 +141,7 @@ class PVConfig:
     pct: float = 0.0                 # % of candidate buses that get PV
     seed: int | None = None
     sizes_kva: tuple = (5.0,)        # inverter ratings drawn at random (kVA)
-    kwp_ratio: float = 1.0           # DC array kWp / inverter kVA
+    kwp_ratio: float = 1.3           # DC array kWp / inverter kVA (typical AU oversizing)
     output_pu: float = 1.0           # fP: 1.0 = full available output
     all_lv_buses: bool = False       # False: only buses that carry a load
     region: str = "A"
@@ -316,7 +335,7 @@ def vecgrp_from_conns(c1: str | None, c2: str | None) -> tuple[int, str]:
     Neutrals are grounded (OpenDSS default), so wye -> YN/yn.
     """
     d1, d2 = is_delta(c1), is_delta(c2)
-    return {(False, False): (5, "YNyn0"), (True, False): (10, "Dyn1"),
+    return {(False, False): (5, "YNyn0"), (True, False): (59, "Dyn11"),
             (True, True): (1, "Dd0"), (False, True): (14, "YNd1")}[(d1, d2)]
 
 
@@ -352,6 +371,89 @@ def phase_summary(loads: list[dict]) -> None:
 def strip_bus_node(bus: str) -> str:
     """Return only the bus name (drop .N.N.N terminal suffix)."""
     return bus.split(".")[0] if bus else bus
+
+
+# ---------------------------------------------------------------------------
+# Residential LV defaults: zero-sequence and equipment data
+# ---------------------------------------------------------------------------
+# Used wherever the OpenDSS file does not supply a value.  Typical figures for
+# an Australian 11 kV / 433 V (230/400 V) residential feeder.
+
+# Household load power factor when the .dss gives neither kvar nor pf.
+DEFAULT_LOAD_PF = 0.95
+
+# Ground-mounted distribution transformer, 100-500 kVA, Dyn11.
+TX_DEFAULTS = dict(
+    uk_pct=4.5,     # short-circuit voltage (%)
+    ur_pct=1.0,     # ohmic part, i.e. copper losses ~1 % of Sn
+    i0_pct=0.3,     # no-load current (%)
+    z0_z1=0.95,     # Dyn: Z0 ~ Z1 (delta winding circulates the zero sequence)
+)
+
+# Used for a cable only if its linecode carries no usable zero-sequence data.
+# LV four-core cable with a neutral: Z0 is roughly 3-4 times Z1.
+LV_CABLE_R0_R1 = 4.0
+LV_CABLE_X0_X1 = 3.0
+
+# Closed switch / link modelled as 1 m of cable with a negligible impedance.
+SWITCH_LEN_KM = 0.001
+SWITCH_Z_OHM_PER_KM = 0.01       # -> 10 uOhm
+SWITCH_Z0_OHM_PER_KM = 0.03
+
+# MV network feeder at the transformer's HV busbar.  Typical 11 kV zone
+# substation fault level 150-350 MVA; the delta winding of the Dyn transformer
+# blocks MV zero sequence from the LV network, so Z0/Z1 has little effect on it.
+SOURCE_SK_MVA = 250.0
+SOURCE_R_X = 0.1
+SOURCE_Z0_Z1 = 1.0
+
+# Element.Flag_Input is a bit mask that switches input sections on in SINCAL.
+# Found by ticking the boxes in the GUI and diffing the database:
+#   default 3;  +4    = "Zero-Phase Sequence Data" enabled (line, load,
+#                        transformer, feeder, ...);  +4096 = converter
+#                        "Power Control" enabled.
+# Without the bit the stored values are ignored (greyed out in the GUI).
+INPUT_ZERO_SEQ = 4
+INPUT_POWER_CTRL = 4096
+
+# Vector groups (SINCAL VecGrp codes) with a delta winding and a grounded star.
+_DELTA_GROUNDED_STAR = {10, 24, 45, 59, 79, 14, 26, 49, 61, 80, 81}
+
+
+def rx_ratio(p: float, q: float, lo: float = 0.5, hi: float = 10.0) -> float:
+    """R/X of a constant-power load or PV from its P and Q (clamped)."""
+    if abs(q) < 1e-12:
+        return hi
+    return min(hi, max(lo, abs(p / q)))
+
+
+def tx_zero_sequence(vecgrp: int, uk: float, ur: float) -> tuple[float, float]:
+    """(Z0/Z1, R0/X0) for a two-winding distribution transformer."""
+    z0_z1 = TX_DEFAULTS["z0_z1"] if vecgrp in _DELTA_GROUNDED_STAR else 1.0
+    xk = math.sqrt(max(uk * uk - ur * ur, 1e-12))
+    return z0_z1, max(ur / xk, 0.01)
+
+
+def lv_cable_zero_sequence(r1: float, x1: float, r0: float, x0: float
+                           ) -> tuple[float, float, bool]:
+    """
+    Zero-sequence R0/X0 (ohm/km).  Uses the linecode's own values when they
+    exist; otherwise falls back to Z0 = 4 R1 + j 3 X1.  Returns (r0, x0, fell_back).
+    """
+    if abs(r0) < 1e-9 and abs(x0) < 1e-9:
+        return (max(r1, 1e-5) * LV_CABLE_R0_R1,
+                max(x1, 1e-5) * LV_CABLE_X0_X1, True)
+    return max(r0, 1e-5), max(x0, 1e-5), False
+
+
+def winding_r_pct(trafo: dict):
+    """Sum of the two winding %r values from a parsed OpenDSS transformer, or None."""
+    ws = trafo.get("_windings", [])
+    try:
+        vals = [float(w["%r"]) for w in ws[:2] if "%r" in w]
+    except ValueError:
+        return None
+    return sum(vals) if len(vals) == 2 else None
 
 
 # ---------------------------------------------------------------------------
@@ -630,6 +732,8 @@ class SincalBuilder:
         self.ctrl_modes_missing = False
         self.pending_phases: list[tuple[str, int]] = []   # (element name, code)
         self.phase_cols: list[tuple[str, str]] = []
+        self._intended: list[tuple[str, str, str, object]] = []   # (table, element, column, value)
+        self.unknown_fields: set[tuple[str, str]] = set()
 
     # ---- lifecycle -------------------------------------------------------
     def create_database(self) -> None:
@@ -688,6 +792,25 @@ class SincalBuilder:
         self._elem_count[bus] = n + 1
         return (x + 0.025 * n, y + side * 0.040)
 
+    # ---- safe field writer ------------------------------------------------
+    def _f(self, obj, table: str, owner: str, field: str, value) -> None:
+        """
+        Set one field.  The name is matched (case-insensitively) against the
+        real database column, because SINCAL silently ignores SetValue calls
+        with a wrong name (e.g. "R" or "Len" on Line, whose columns are r / l).
+        Unknown names are reported once.  Every write is recorded so
+        apply_fields_sql() can enforce and verify it after the build.
+        """
+        cols = self._columns.get(table)
+        real = cols.get(field.lower()) if cols else field
+        if real is None:
+            if (table, field) not in self.unknown_fields:
+                self.unknown_fields.add((table, field))
+                print(f"  [WARN] {table} has no column '{field}' - value not written")
+            return
+        obj.SetValue(real, value)
+        self._intended.append((table, owner, real, value))
+
     # ---- element creators ------------------------------------------------
     def ensure_voltage_level(self, name: str, kv: float) -> int:
         if name in self.voltage_levels:
@@ -719,81 +842,87 @@ class SincalBuilder:
         return n.RowId
 
     def create_infeeder(self, name, node, kv, v_pu=1.0, angle_deg=0.0,
-                        sk_mva=100.0, r_x=0.1):
+                        sk_mva=SOURCE_SK_MVA, r_x=SOURCE_R_X):
+        T = "Infeeder"
         n = self.db.GetCommonObject("Node", node)
         inf = self.db.CreateElement("Infeeder", name, n)
         Z = (kv ** 2) / sk_mva if sk_mva > 0 else 1e-6
         X = Z / math.sqrt(1 + r_x ** 2)
         R = r_x * X
-        inf.SetValue("Flag_Lf", 3)           # |usrc| & delta
-        inf.SetValue("Flag_Typ", 1)          # R & X
-        inf.SetValue("R", R)
-        inf.SetValue("X", X)
-        inf.SetValue("R_X", r_x)
-        inf.SetValue("Sk2", sk_mva)
-        inf.SetValue("u", v_pu * 100.0)
-        inf.SetValue("delta", angle_deg)
-        # ---- zero-sequence: symmetric source (Z0 = Z1) ----
-        inf.SetValue("Flag_Z0", 1)           # fixed grounded
-        inf.SetValue("Flag_Z0_Input", 1)     # Z0/Z1 and R0/X0
-        inf.SetValue("Z0_Z1", 1.0)
-        inf.SetValue("R0_X0", r_x)
+        f = lambda k, v: self._f(inf, T, name, k, v)
+        f("Flag_Lf", 3)                      # |usrc| & delta
+        f("Flag_Typ", 1)                     # R & X
+        f("R", R)
+        f("X", X)
+        f("R_X", r_x)
+        f("Sk2", float(sk_mva))
+        f("u", v_pu * 100.0)
+        f("delta", angle_deg)
+        # ---- zero sequence: solidly grounded source, Z0 = Z1 ----
+        f("Flag_Z0", 1)                      # fixed grounded
+        f("Flag_Z0_Input", 1)                # Z0/Z1 and R0/X0
+        f("Z0_Z1", SOURCE_Z0_Z1)
+        f("R0_X0", r_x)
         inf.Update()
         if self.graphics:
             sx, sy = self._symbol_pos(node, side=+1)
             inf.CreateGraphic(sx, sy)
-        print(f"    + Infeeder  {name:<10} @ {node}  ({kv} kV)")
+        print(f"    + Infeeder  {name:<10} @ {node}  ({kv} kV, Sk''={sk_mva:.0f} MVA)")
         return inf
 
     def create_line(self, name, n1_name, n2_name, length_km, seq):
+        T = "Line"
         n1 = self.db.GetCommonObject("Node", n1_name)
         n2 = self.db.GetCommonObject("Node", n2_name)
         ln = self.db.CreateElement("Line", name, n1, n2)
-        ln.SetValue("Flag_LineTyp", 1)       # cable
-        # Floor the stored length at 1 m.  Some OpenDSS LV networks have
-        # sub-millimetre segments (67 um) that would otherwise trigger
-        # "2603 Short circuit impedance is equal to zero".
-        ln.SetValue("Len", max(float(length_km), 1e-3))
-        ln.SetValue("ParSys", 1.0)
-        ln.SetValue("R", float(seq["R1"]))
-        ln.SetValue("X", float(seq["X1"]))
-        ln.SetValue("C", float(seq["C1"]))
-        ln.SetValue("FrqNenn", float(self.freq))
-        ln.SetValue("Flag_Lf", 1)
-        # ---- zero-sequence: explicit R0/X0, never 0 ----
-        r0 = float(seq["R0"])
-        x0 = float(seq["X0"])
-        if abs(r0) < 1e-9 and abs(x0) < 1e-9:
-            r0, x0 = 1e-5, 1e-5
-        ln.SetValue("Flag_Z0_Input", 2)      # R0 and X0 directly
-        ln.SetValue("R0", r0)
-        ln.SetValue("X0", x0)
-        try:
-            ln.SetValue("C0", float(seq.get("C0", 0.0)))
-        except Exception:
-            pass        # C0 is optional; ignore if this DB version lacks it
+        f = lambda k, v: self._f(ln, T, name, k, v)
+        f("Flag_LineTyp", 1)                 # cable
+        # Floor the length at 1 m: some OpenDSS LV networks have sub-mm
+        # segments that would trigger "2603 Short circuit impedance is zero".
+        f("l", max(float(length_km), 1e-3))
+        f("ParSys", 1.0)
+        f("r", float(seq["R1"]))
+        f("x", float(seq["X1"]))
+        f("c", float(seq["C1"]))
+        f("fn", float(self.freq))
+        # ---- zero sequence: explicit r0 / x0 in ohm/km, never 0 ----
+        r0, x0, fell_back = lv_cable_zero_sequence(
+            float(seq["R1"]), float(seq["X1"]), float(seq["R0"]), float(seq["X0"]))
+        f("Flag_Z0_Input", 2)                # r0 and x0
+        f("r0", r0)
+        f("x0", x0)
+        f("c0", float(seq.get("C0", 0.0)))
         ln.Update()
         if self.graphics:
             ln.CreateGraphic()
-        print(f"    + Line      {name:<12} {n1_name} -> {n2_name}  ({length_km:.6f} km)")
+        tag = "  (Z0 default: 4R1 + j3X1)" if fell_back else ""
+        print(f"    + Line      {name:<12} {n1_name} -> {n2_name}  "
+              f"({length_km:.6f} km){tag}")
         return ln
 
     def create_switch_line(self, name, n1_name, n2_name):
+        """
+        Closed switch / link = 1 m of cable with a negligible impedance.
+        (A SINCAL 'connector' line type is NOT used: with it SINCAL treats the
+        switch as open in the zero-sequence system and drops everything behind
+        it from the unbalanced power flow - warnings 1045 / 1057.)
+        """
+        T = "Line"
         n1 = self.db.GetCommonObject("Node", n1_name)
         n2 = self.db.GetCommonObject("Node", n2_name)
         ln = self.db.CreateElement("Line", name, n1, n2)
-        ln.SetValue("Flag_LineTyp", 3)       # connector
-        ln.SetValue("Len", 0.001)
-        ln.SetValue("ParSys", 1.0)
-        ln.SetValue("R", 1e-5)
-        ln.SetValue("X", 1e-5)
-        ln.SetValue("C", 0.0)
-        ln.SetValue("FrqNenn", float(self.freq))
-        ln.SetValue("Flag_Lf", 1)
-        # ---- zero-sequence: explicit tiny R0/X0 (not 0, not default) ----
-        ln.SetValue("Flag_Z0_Input", 2)
-        ln.SetValue("R0", 1e-5)
-        ln.SetValue("X0", 1e-5)
+        f = lambda k, v: self._f(ln, T, name, k, v)
+        f("Flag_LineTyp", 1)                 # cable
+        f("l", SWITCH_LEN_KM)
+        f("ParSys", 1.0)
+        f("r", SWITCH_Z_OHM_PER_KM)
+        f("x", SWITCH_Z_OHM_PER_KM)
+        f("c", 0.0)
+        f("fn", float(self.freq))
+        f("Flag_Z0_Input", 2)
+        f("r0", SWITCH_Z0_OHM_PER_KM)
+        f("x0", SWITCH_Z0_OHM_PER_KM)
+        f("c0", 0.0)
         ln.Update()
         if self.graphics:
             ln.CreateGraphic()
@@ -801,28 +930,35 @@ class SincalBuilder:
         return ln
 
     def create_transformer(self, name, n1_name, n2_name,
-                           kv1, kv2, sn_mva, uk_pct=6.0, ur_pct=0.5,
-                           vecgrp=1, vg_label=""):
+                           kv1, kv2, sn_mva,
+                           uk_pct=TX_DEFAULTS["uk_pct"], ur_pct=TX_DEFAULTS["ur_pct"],
+                           vecgrp=59, vg_label=""):
+        T = "TwoWindingTransformer"
         n1 = self.db.GetCommonObject("Node", n1_name)
         n2 = self.db.GetCommonObject("Node", n2_name)
         t = self.db.CreateElement("TwoWindingTransformer", name, n1, n2)
-        t.SetValue("Sn", float(sn_mva))
-        t.SetValue("Un1", float(kv1))
-        t.SetValue("Un2", float(kv2))
-        t.SetValue("uk", float(uk_pct))
-        t.SetValue("ur", float(ur_pct))
-        t.SetValue("Flag_Ur", 1)
-        t.SetValue("VecGrp", int(vecgrp))
-        t.SetValue("Flag_Lf", 1)
-        t.SetValue("Flag_ConNode", 1)
-        # ---- zero-sequence: Dyn gives Z0 = Z1 (delta provides return path) ----
-        t.SetValue("Flag_Z0_Input", 1)       # Z0/Z1 and R0/X0
-        t.SetValue("Z0_Z1", 1.0)
-        t.SetValue("R0_X0", 0.1)
+        f = lambda k, v: self._f(t, T, name, k, v)
+        f("Sn", float(sn_mva))
+        f("Un1", float(kv1))
+        f("Un2", float(kv2))
+        f("uk", float(uk_pct))
+        f("Flag_ur", 1)                      # ur = ohmic part of uk
+        f("ur", float(ur_pct))
+        f("i0", TX_DEFAULTS["i0_pct"])
+        f("VecGrp", int(vecgrp))
+        f("Flag_Lf", 1)
+        f("Flag_ConNode", 1)
+        # ---- zero sequence ----
+        z0_z1, r0_x0 = tx_zero_sequence(int(vecgrp), float(uk_pct), float(ur_pct))
+        f("Flag_Z0_Input", 1)                # Z0/Z1 and R0/X0
+        f("Z0_Z1", z0_z1)
+        f("R0_X0", r0_x0)
         t.Update()
         if self.graphics:
             t.CreateGraphic()
-        print(f"    + Trafo     {name:<12} {n1_name}({kv1}kV) -> {n2_name}({kv2}kV)  {vg_label}")
+        print(f"    + Trafo     {name:<12} {n1_name}({kv1}kV) -> {n2_name}({kv2}kV)  "
+              f"{vg_label}  {sn_mva*1000:.0f} kVA uk={uk_pct:.1f}% ur={ur_pct:.2f}% "
+              f"Z0/Z1={z0_z1:.2f}")
         return t
 
     def create_load(self, name, node, p_mw, q_mvar, conn=None):
@@ -830,43 +966,44 @@ class SincalBuilder:
         conn: (kind, phase_nodes) from load_connection(); None or "3ph" gives
         the original balanced load.
         """
+        T = "Load"
         n = self.db.GetCommonObject("Node", node)
         ld = self.db.CreateElement("Load", name, n)
+        f = lambda k, v: self._f(ld, T, name, k, v)
         kind, ph = conn if conn else ("3ph", (1, 2, 3))
-        ld.SetValue("Flag_Load", 1)
-        ld.SetValue("Flag_Typified", 3)      # household
-        ld.SetValue("Flag_LoadType", 2)      # P, Q constant
-        # ---- zero-sequence: grounded load, Z0 = Z1 ----
-        ld.SetValue("Flag_Z0", 1)            # fixed grounded
-        ld.SetValue("Flag_Z0_Input", 1)      # Z0/Z1 and R0/X0
-        ld.SetValue("Z0_Z1", 1.0)
-        ld.SetValue("R0_X0", 1.0)
-        ld.SetValue("P", float(p_mw))
-        ld.SetValue("Q", float(q_mvar))
-        phase_set = kind in ("1ph", "ll")
-        if phase_set:
-            self.queue_phase(name, ph)      # Terminal.Flag_Terminal, written post-build
+        f("Flag_Load", 1)
+        f("Flag_Typified", 3)                # household
+        f("Flag_LoadType", 2)                # P, Q constant
+        # ---- zero sequence: grounded (wye) load, Z0 = Z1, R/X from its pf ----
+        f("Flag_Z0", 1)                      # fixed grounded
+        f("Flag_Z0_Input", 1)                # Z0/Z1 and R0/X0
+        f("Z0_Z1", 1.0)
+        f("R0_X0", rx_ratio(p_mw, q_mvar))
+        f("P", float(p_mw))
+        f("Q", float(q_mvar))
+        if kind in ("1ph", "ll"):
+            self.queue_phase(name, ph)       # Terminal.Flag_Terminal, written post-build
         if kind == "3ph":
-            ld.SetValue("Flag_Lf", 1)
+            f("Flag_Lf", 1)
             where = "L123"
         elif kind == "1ph":
-            ld.SetValue("Flag_Lf", 1)
+            f("Flag_Lf", 1)
             where = "L" + "".join(str(k) for k in sorted(ph))
         elif kind == "2ph":
-            ld.SetValue("Flag_Lf", 13)       # Pi, Qi and (v) - star
+            f("Flag_Lf", 13)                 # Pi, Qi and (v) - star
             for k in (1, 2, 3):
                 share = (1.0 / len(ph)) if k in ph else 0.0
-                ld.SetValue(f"P{k}", float(p_mw) * share)
-                ld.SetValue(f"Q{k}", float(q_mvar) * share)
+                f(f"P{k}", float(p_mw) * share)
+                f(f"Q{k}", float(q_mvar) * share)
             where = "L" + "".join(str(k) for k in ph)
         else:                                # "ll": phase-to-phase
-            ld.SetValue("Flag_Lf", 14)       # Pij, Qij and (v) - delta
+            f("Flag_Lf", 14)                 # Pij, Qij and (v) - delta
             key = {frozenset({1, 2}): "12", frozenset({2, 3}): "23",
                    frozenset({1, 3}): "31"}[frozenset(ph)]
             for kk in ("12", "23", "31"):
                 on = 1.0 if kk == key else 0.0
-                ld.SetValue(f"P{kk}", float(p_mw) * on)
-                ld.SetValue(f"Q{kk}", float(q_mvar) * on)
+                f(f"P{kk}", float(p_mw) * on)
+                f(f"Q{kk}", float(q_mvar) * on)
             where = "L" + key
         ld.Update()
         if self.graphics:
@@ -877,17 +1014,19 @@ class SincalBuilder:
         return ld
 
     def create_shunt_impedance(self, name, node, r_ohm, x_ohm, kv):
+        T = "ShuntImpedance"
         n = self.db.GetCommonObject("Node", node)
         sh = self.db.CreateElement("ShuntImpedance", name, n)
-        sh.SetValue("Un", float(kv))
-        sh.SetValue("R", float(r_ohm))
-        sh.SetValue("X", float(x_ohm))
-        sh.SetValue("Flag_Lf", 1)
-        # ---- zero-sequence: grounded shunt, Z0 = Z1 ----
-        sh.SetValue("Flag_Z0", 1)
-        sh.SetValue("Flag_Z0_Input", 1)
-        sh.SetValue("Z0_Z1", 1.0)
-        sh.SetValue("R0_X0", 1.0)
+        f = lambda k, v: self._f(sh, T, name, k, v)
+        f("Un", float(kv))
+        f("R", float(r_ohm))
+        f("X", float(x_ohm))
+        f("Flag_Lf", 1)
+        # ---- zero sequence: grounded shunt, Z0 = Z1 ----
+        f("Flag_Z0", 1)
+        f("Flag_Z0_Input", 1)
+        f("Z0_Z1", 1.0)
+        f("R0_X0", 1.0)
         sh.Update()
         if self.graphics:
             sx, sy = self._symbol_pos(node, side=-1)
@@ -1043,57 +1182,36 @@ class SincalBuilder:
 
     def _create_pv_varshunt(self, name, node, n, p_rated, sn, cfg, phases, kv_ll):
         """
-        Single-phase PV as a VarShuntElement (boundary injection).
+        Single-phase PV as a VarShuntElement (constant P/Q injection).
 
-        Unlike DCInfeeder, VarShuntElement carries the full zero-sequence model
-        (Flag_Z0_Input / Z0_Z1 / R0_X0), so a single-phase terminal does not
-        make the LF_USYM zero-sequence network singular.  This is what lets
-        a residential PV system be modelled on the same phase as the
-        residential load.
-
-        The power field is ``Plf`` / ``Qlf`` / ``Ulf`` (lowercase 'l'), not
-        ``PIf`` / ``QIf`` / ``UIf`` as written in the DB-description PDF.
-        SetValue with the wrong spelling is silently swallowed by SINCAL,
-        so this method reads the field back and raises if the write did
-        not stick.
+        VarShuntElement carries a zero-sequence model (Flag_Z0_Input / Z0_Z1 /
+        R0_X0) next to a single-phase terminal, so it works in LF_USYM on the
+        same phase as the household load.  Plf uses SINCAL's LOAD convention,
+        so generation is NEGATIVE.  Fields are Plf / Qlf / Ulf (lowercase 'l'),
+        not PIf / QIf / UIf as written in the PDF.
         """
+        T = "VarShuntElement"
         pv = self.db.CreateElement("VarShuntElement", name, n)
+        f = lambda k, v: self._f(pv, T, name, k, v)
 
-        # --- Power flow type ---
-        pv.SetValue("Flag_LF", 1)                 # 1 = Power (Plf / Qlf)
-        pv.SetValue("Flag_LoadType", 2)           # 2 = P and Q constant
         want = PV_SHUNT_P_SIGN * p_rated * float(cfg.output_pu)
-        pv.SetValue("Plf", want)
-        pv.SetValue("Qlf", 0.0)                   # unity PF
-        pv.SetValue("Ulf", float(kv_ll))
-
-        # --- Zero-sequence data (identical convention to Load) ---
-        pv.SetValue("Flag_Z0_Input", 1)           # Z0/Z1 and R0/X0
-        pv.SetValue("Z0_Z1", 1.0)
-        pv.SetValue("R0_X0", 1.0)
-        pv.SetValue("Pneg", 0.0)
-        pv.SetValue("Qneg", 0.0)
-
+        f("Flag_LF", 1)                           # 1 = Power (Plf / Qlf)
+        f("Flag_LoadType", 2)                     # 2 = P and Q constant
+        f("Plf", want)
+        f("Qlf", 0.0)                             # unity power factor
+        f("Ulf", float(kv_ll))
+        # ---- zero sequence: same convention as the household load ----
+        f("Flag_Z0_Input", 1)                     # Z0/Z1 and R0/X0
+        f("Z0_Z1", 1.0)
+        f("R0_X0", rx_ratio(want, 0.0))
+        f("Pneg", 0.0)
+        f("Qneg", 0.0)
         pv.Update()
-
-        # --- Read back and confirm the power field stuck ---
-        try:
-            got = float(pv.GetValue("Plf"))
-        except Exception:
-            got = None
-        if got is None or abs(got - want) > 1e-6:
-            raise RuntimeError(
-                f"PV shunt '{name}': Plf did not stick "
-                f"(requested {want:+.6f} MW, read back {got}). "
-                f"Check the actual column name with "
-                f"PRAGMA table_info(\"VarShuntElement\").")
-
         self.queue_phase(name, phases)
 
         if self.graphics:
             sx, sy = self._symbol_pos(node, side=+1)
             pv.CreateGraphic(sx, sy)
-
         ph_txt = "L" + "".join(str(k) for k in sorted(phases))
         print(f"    + PV (VarShunt) {name:<16} @ {node}  {ph_txt:<4} "
               f"Sn={sn*1000:.1f} kVA  Plf={want*1000:+.2f} kW")
@@ -1107,61 +1225,68 @@ class SincalBuilder:
         p_rated = min(kwp, kva) / 1000.0           # MW, inverter-limited
         n = self.db.GetCommonObject("Node", node)
 
-        # Single-phase PV: use VarShuntElement (has zero-sequence data).
         if cfg.use_varshunt:
             return self._create_pv_varshunt(name, node, n, p_rated, sn,
                                             cfg, phases, kv_ll)
 
-        # Balanced three-phase PV: use DCInfeeder with AS/NZS 4777.2.
+        # ---- Converter (DCInfeeder) acting as a rooftop PV inverter ----
+        T = "DCInfeeder"
         vv = std["vv"]
         pct = lambda v: 100.0 * v / v_base
-
         cv = self.db.CreateElement("DCInfeeder", name, n)
+        f = lambda k, v: self._f(cv, T, name, k, v)
 
-        # --- Basic / converter data ---
-        cv.SetValue("Flag_DCtyp", 7)               # photovoltaic system
-        cv.SetValue("Flag_Connect", 1)             # directly, no step-up trafo
-        cv.SetValue("IslandOp", 0)
-        cv.SetValue("Sn_Inverter", sn)
-        cv.SetValue("Ur_Inverter", float(kv_ll))
-        cv.SetValue("Umin_Inverter", 80.0)
-        cv.SetValue("Umax_Inverter", 120.0)
-        cv.SetValue("Flag_Lf", 1)                  # P and Q
-        cv.SetValue("P", PV_P_SIGN * p_rated)
-        cv.SetValue("Q", 0.0)
-        cv.SetValue("fP", float(cfg.output_pu))
-        cv.SetValue("fQ", 1.0)
+        # Plant / converter data
+        f("Flag_DCtyp", 7)                         # photovoltaic system
+        f("Flag_Connect", 1)                       # directly, no step-up trafo
+        f("IslandOp", 0)                           # grid-following, no islanding
+        f("Sn_Inverter", sn)
+        f("Ur_Inverter", float(kv_ll))
+        f("Umin_Inverter", 80.0)                   # %
+        f("Umax_Inverter", 115.0)                  # % (AS/NZS 4777.2 trips at 265 V)
+        f("DC_power", float(kwp) / 1000.0)         # installed array size, MW
 
-        # --- Limits ---
-        cv.SetValue("Flag_LfLimit", 5)             # limits on P and Q
-        cv.SetValue("Flag_ChkType", 1)             # warning on violation
-        cv.SetValue("Flag_LimitType", 1)           # limits act on the output
-        cv.SetValue("Pmax", p_rated)
-        cv.SetValue("Pmin", 0.0)
+        # Operating point: P and Q at the AC terminals, generation positive
+        f("Flag_Lf", 1)                            # P and Q
+        f("P", PV_P_SIGN * p_rated)
+        f("Q", 0.0)
+        f("fP", float(cfg.output_pu))
+        f("fQ", 1.0)
+
+        # Fault contribution: grid-following inverter, ~1.1 x rated current
+        f("Flag_Converter", 0)                     # factor x rated current
+        f("fSC", 1.1)
+
+        # Limits
+        f("Flag_LfLimit", 5)                       # limits on P and Q
+        f("Flag_ChkType", 1)                       # warning on violation
+        f("Flag_LimitType", 1)                     # limits act on the output
+        f("Pmax", p_rated)
+        f("Pmin", 0.0)
         q_lim = max(std["q_cap"], std["q_ind"]) * sn
-        cv.SetValue("Qmax", q_lim)
-        cv.SetValue("Qmin", -q_lim)
-        cv.SetValue("cosphi_lim", round(math.sqrt(1 - std["q_ind"] ** 2), 3))
-        cv.SetValue("Flag_CtrlPrior", 2)           # reactive power priority
+        f("Qmax", q_lim)
+        f("Qmin", -q_lim)
+        f("cosphi_lim", round(math.sqrt(1 - std["q_ind"] ** 2), 3))
+        f("Flag_CtrlPrior", 2)                     # reactive power priority
 
-        # --- Controller: AS/NZS 4777.2 volt-watt and volt-var ---
+        # Grid-support controllers: AS/NZS 4777.2:2020 volt-watt and volt-var
         if vp_id is not None:
-            cv.SetValue("Flag_Pctrl", 1)           # Volt-watt (of Pn)
-            cv.SetValue("Qctrl_U_P_ID", int(vp_id))
+            f("Flag_Pctrl", 1)                     # Volt-watt (of Pn)
+            f("Qctrl_U_P_ID", int(vp_id))
         if PV_VOLTVAR_MODE == "volt_var" and vq_id is not None:
-            cv.SetValue("Flag_Qctrl", 3)           # Volt-var
-            cv.SetValue("Qctrl_U_Q_ID", int(vq_id))
+            f("Flag_Qctrl", 3)                     # Volt-var
+            f("Qctrl_U_Q_ID", int(vq_id))
             q_pu = max(std["q_cap"], std["q_ind"])
-            cv.SetValue("Qctrl_Qmin", -q_pu)
-            cv.SetValue("Qctrl_Qmax",  q_pu)
+            f("Qctrl_Qmin", -q_pu)
+            f("Qctrl_Qmax", q_pu)
         elif PV_VOLTVAR_MODE == "volt_pf":
-            cv.SetValue("Flag_Qctrl", 1)           # Volt-power factor
-            cv.SetValue("Qctrl_cosphi_c", -round(math.sqrt(1 - std["q_cap"] ** 2), 4))
-            cv.SetValue("Qctrl_U1_c", round(pct(vv[1]), 2))
-            cv.SetValue("Qctrl_U2_c", round(pct(vv[0]), 2))
-            cv.SetValue("Qctrl_cosphi", round(math.sqrt(1 - std["q_ind"] ** 2), 4))
-            cv.SetValue("Qctrl_U1", round(pct(vv[2]), 2))
-            cv.SetValue("Qctrl_U2", round(pct(vv[3]), 2))
+            f("Flag_Qctrl", 1)                     # Volt-power factor
+            f("Qctrl_cosphi_c", -round(math.sqrt(1 - std["q_cap"] ** 2), 4))
+            f("Qctrl_U1_c", round(pct(vv[1]), 2))
+            f("Qctrl_U2_c", round(pct(vv[0]), 2))
+            f("Qctrl_cosphi", round(math.sqrt(1 - std["q_ind"] ** 2), 4))
+            f("Qctrl_U1", round(pct(vv[2]), 2))
+            f("Qctrl_U2", round(pct(vv[3]), 2))
         cv.Update()
         self.queue_phase(name, phases)
 
@@ -1170,8 +1295,88 @@ class SincalBuilder:
             cv.CreateGraphic(sx, sy)
         ph_txt = "L" + "".join(str(k) for k in sorted(phases))
         print(f"    + PV conv   {name:<16} @ {node}  {ph_txt:<4} Sn={kva:.1f} kVA  "
-              f"Pmax={p_rated * 1000:.2f} kW")
+              f"Pmax={p_rated * 1000:.2f} kW  (array {kwp:.1f} kWp)")
         return cv
+
+    def apply_fields_sql(self) -> None:
+        """
+        Enforce every field written through _f() directly in the database and
+        report any that did not stick through COM (SINCAL ignores some
+        SetValue calls without an error).  Run after close().
+        """
+        if not self._intended:
+            return
+        con = sqlite3.connect(self.db_file)
+        fixed: Counter = Counter()
+        missing: list[str] = []
+        try:
+            for table, owner, col, value in self._intended:
+                where = ('WHERE "Element_ID" IN (SELECT "Element_ID" FROM "Element" '
+                         'WHERE "Name"=? AND "Flag_Variant"=1) AND "Flag_Variant"=1')
+                row = con.execute(f'SELECT "{col}" FROM "{table}" {where}',
+                                  (owner,)).fetchone()
+                if row is None:
+                    missing.append(f"{owner} ({table})")
+                    continue
+                cur = row[0]
+                try:
+                    same = cur is not None and math.isclose(
+                        float(cur), float(value), rel_tol=1e-9, abs_tol=1e-12)
+                except (TypeError, ValueError):
+                    same = cur == value
+                if not same:
+                    con.execute(f'UPDATE "{table}" SET "{col}"=? {where}',
+                                (value, owner))
+                    fixed[(table, col)] += 1
+            con.commit()
+        finally:
+            con.close()
+        self._enable_input_flags()
+        n = len(self._intended)
+        nfix = sum(fixed.values())
+        print(f"\n    Field check: {n - nfix - len(missing)} of {n} values stored "
+              f"correctly through COM; {nfix} corrected directly in the database")
+        if fixed:
+            parts = ", ".join(f"{t}.{c} x{k}" for (t, c), k in sorted(fixed.items()))
+            print(f"      corrected: {parts}")
+        if missing:
+            print(f"  [WARN] element rows not found for {len(missing)} write(s): "
+                  + ", ".join(sorted(set(missing))[:6]))
+        self._intended = []
+
+    def _enable_input_flags(self) -> None:
+        """
+        Switch on the zero-sequence / power-control input sections via
+        Element.Flag_Input, for every element that was given such data.
+        """
+        z0 = {o for (_t, o, c, _v) in self._intended if c.lower() == "flag_z0_input"}
+        pc = {o for (_t, o, c, v) in self._intended
+              if c.lower() in ("flag_pctrl", "flag_qctrl") and v}
+        if not (z0 or pc):
+            return
+        con = sqlite3.connect(self.db_file)
+        bad: list[str] = []
+        try:
+            cols = {r[1].lower() for r in con.execute('PRAGMA table_info("Element")')}
+            if "flag_input" not in cols:
+                print("  [WARN] Element.Flag_Input not found - zero-sequence / power "
+                      "control data is NOT enabled")
+                return
+            for owners, bit in ((z0, INPUT_ZERO_SEQ), (pc, INPUT_POWER_CTRL)):
+                for name in owners:
+                    con.execute('UPDATE "Element" SET "Flag_Input"=COALESCE("Flag_Input",0)|? '
+                                'WHERE "Name"=? AND "Flag_Variant"=1', (bit, name))
+                    row = con.execute('SELECT "Flag_Input" FROM "Element" WHERE "Name"=? '
+                                      'AND "Flag_Variant"=1', (name,)).fetchone()
+                    if row is None or not (int(row[0]) & bit):
+                        bad.append(name)
+            con.commit()
+        finally:
+            con.close()
+        print(f"    Input sections enabled: zero-sequence data on {len(z0)} elements, "
+              f"power control on {len(pc)} converters")
+        if bad:
+            print("  [WARN] Flag_Input not set for: " + ", ".join(sorted(set(bad))[:8]))
 
     def verify_solve(self, method: str = "LF") -> bool:
         SimSrv = win32com.client.Dispatch(f"Sincal.SimulationSrv.{COM_VER}")
@@ -1183,15 +1388,47 @@ class SincalBuilder:
         status = Sim.StatusID
         text = Sim.StatusText
         print(f"\n  Verification ({method}): status={status} ({text})")
-        if status != 1101:
-            kinds = {1: "STATUS", 2: "INFO", 3: "WARNING", 4: "ERROR", 6: "TASK"}
-            msgs = Sim.Messages
-            for i in range(1, msgs.Count + 1):
-                m = msgs.Item(i)
-                print(f"    [{kinds.get(m.Type, m.Type):>7}] {m.MessageId:>6}  {m.Text}")
+
+        names: dict[int, str] = {}
+        try:
+            con = sqlite3.connect(f"file:{self.db_file}?mode=ro", uri=True)
+            names = dict(con.execute(
+                'SELECT "Element_ID", "Name" FROM "Element" WHERE "Flag_Variant"=1'))
+            con.close()
+        except Exception:
+            pass
+
+        def objects(m) -> str:
+            try:
+                ids = [int(m.ObjectIdAt(i)) for i in range(1, int(m.CountObjectIds) + 1)]
+            except Exception:
+                return ""
+            shown = ", ".join(f"{names.get(i, '?')}({i})" for i in ids[:10])
+            return f"  -> {shown}" + (" ..." if len(ids) > 10 else "")
+
+        excluded: list[str] = []
+        kinds = {1: "STATUS", 2: "INFO", 3: "WARNING", 4: "ERROR", 6: "TASK"}
+        msgs = Sim.Messages
+        for i in range(1, msgs.Count + 1):
+            m = msgs.Item(i)
+            if m.Type in (3, 4) or status != 1101:
+                print(f"    [{kinds.get(m.Type, m.Type):>7}] {m.MessageId:>6}  "
+                      f"{m.Text}{objects(m)}")
+            if m.MessageId == 1045:               # not considered in simulation
+                try:
+                    excluded += [names.get(int(m.ObjectIdAt(j)), "?")
+                                 for j in range(1, int(m.CountObjectIds) + 1)]
+                except Exception:
+                    pass
         Sim = None
         SimSrv = None
-        return status == 1101
+        if excluded:
+            print(f"\n  [WARN] {len(excluded)} element(s) are NOT part of the power "
+                  f"flow (message 1045): {', '.join(excluded[:12])}"
+                  f"{' ...' if len(excluded) > 12 else ''}\n"
+                  f"         The solve 'succeeds' but those loads / generators have "
+                  f"no effect on the results.")
+        return status == 1101 and not excluded
 
 
 # ---------------------------------------------------------------------------
@@ -1259,7 +1496,8 @@ def build_linecode_lookup(parser: OpenDSSParser) -> dict[str, dict]:
             f = lambda k, d: float(p.get(k, [d])[0])
             r1, x1, c1 = f("r1", 0.0), f("x1", 0.0), f("c1", 0.0)
             seq = {"R1": r1, "X1": x1, "C1": c1,
-                   "R0": f("r0", r1), "X0": f("x0", x1), "C0": f("c0", c1),
+                   "R0": f("r0", r1 * LV_CABLE_R0_R1), "X0": f("x0", x1 * LV_CABLE_X0_X1),
+                   "C0": f("c0", c1),
                    "asym": 0.0}
         if seq is None:
             print(f"  [warn] linecode '{name}': no matrices or sequence data, "
@@ -1393,7 +1631,8 @@ def run_conversion(master: str, out_dir: str | None, out_name: str | None,
                    pv: PVConfig | None = None,
                    phase_aware: bool = True,
                    merge_closed_switches: bool | None = None,
-                   legacy_ground_shunts: bool = False) -> None:
+                   legacy_ground_shunts: bool = False,
+                   source_sk_mva: float = SOURCE_SK_MVA) -> None:
     pv = pv or PVConfig()
     if pv.region not in PV_REGIONS:
         raise ValueError(f"PV region '{pv.region}' not defined in PV_REGIONS")
@@ -1485,8 +1724,8 @@ def run_conversion(master: str, out_dir: str | None, out_name: str | None,
             kv=parser.base_kv,
             v_pu=1.0,
             angle_deg=0.0,
-            sk_mva=100.0,
-            r_x=0.1,
+            sk_mva=source_sk_mva,
+            r_x=SOURCE_R_X,
         )
     for vs in parser.vsources:
         bus = strip_bus_node(vs.get("bus1", [""])[0])
@@ -1497,7 +1736,8 @@ def run_conversion(master: str, out_dir: str | None, out_name: str | None,
             kv=kv,
             v_pu=float(vs.get("pu", ["1.0"])[0]),
             angle_deg=float(vs.get("angle", ["0"])[0]),
-            sk_mva=100.0,
+            sk_mva=source_sk_mva,
+            r_x=SOURCE_R_X,
         )
 
     # transformers
@@ -1517,13 +1757,16 @@ def run_conversion(master: str, out_dir: str | None, out_name: str | None,
             continue
         sn = kva / 1000.0
         try:
-            uk = float(t.get("xhl", ["6"])[0])
+            uk = float(t.get("xhl", [TX_DEFAULTS["uk_pct"]])[0])
         except (ValueError, KeyError):
-            uk = 6.0
+            uk = TX_DEFAULTS["uk_pct"]
         if uk < 1.0:
             uk *= 100.0
+        ur = winding_r_pct(t)                 # from the .dss %r of both windings
+        if ur is None or not 0.0 < ur < uk:
+            ur = min(TX_DEFAULTS["ur_pct"], 0.5 * uk)
         vg, vg_label = vecgrp_from_conns(w1.get("conn"), w2.get("conn"))
-        b.create_transformer(t["_name"], b1, b2, kv1, kv2, sn, uk, 0.5,
+        b.create_transformer(t["_name"], b1, b2, kv1, kv2, sn, uk, ur,
                              vecgrp=vg, vg_label=vg_label)
 
     # lines
@@ -1575,14 +1818,14 @@ def run_conversion(master: str, out_dir: str | None, out_name: str | None,
             except (ValueError, ZeroDivisionError):
                 kvar = 0.0
         else:
-            kvar = 0.0
+            kvar = kw * math.tan(math.acos(DEFAULT_LOAD_PF))   # household pf
         conn = load_connection(ld) if phase_aware else None
         b.create_load(ld["_name"], bus, kw / 1000.0, kvar / 1000.0, conn)
 
     # PV converters (random subset of customer buses)
     if pv.pct > 0:
         mode_label = "VarShuntElement at unity PF" if pv.use_varshunt \
-                     else "DCInfeeder with AS/NZS 4777.2 controllers"
+                     else "Converter (DCInfeeder, PV) with AS/NZS 4777.2 controllers"
         print(f"\n    --- PV converters ({mode_label}) ---")
         std = PV_REGIONS[pv.region]
         chosen = select_pv_buses(parser, bus_kv, pv, phase_aware)
@@ -1639,6 +1882,7 @@ def run_conversion(master: str, out_dir: str | None, out_name: str | None,
               "the 4-wire neutral is treated as solidly/multi-grounded.")
         print("      " + "; ".join(skipped_gnd[:4]) + (" ..." if len(skipped_gnd) > 4 else ""))
     b.close()
+    b.apply_fields_sql()
     b.apply_pending_phases_sql()
     if phase_aware or pv.pct > 0:
         b.report_phase_status(use_varshunt=pv.use_varshunt)
@@ -1688,23 +1932,28 @@ def main() -> None:
     g.add_argument("--pv-kva-list", default="5",
                    help="Comma-separated inverter sizes in kVA drawn at "
                         "random per site (default 5)")
-    g.add_argument("--pv-kwp-ratio", type=float, default=1.0,
-                   help="DC array kWp / inverter kVA (default 1.0)")
+    g.add_argument("--pv-kwp-ratio", type=float, default=1.3,
+                   help="DC array kWp / inverter kVA (default 1.3)")
     g.add_argument("--pv-output", type=float, default=1.0,
                    help="fP: PV output as fraction of rated (default 1.0)")
     g.add_argument("--pv-all-lv-buses", action="store_true",
                    help="Candidates are all LV buses, not just buses with loads")
     g.add_argument("--pv-region", default="A",
                    help="AS/NZS 4777.2 region settings (default A)")
-    g.add_argument("--pv-element", choices=["varshunt", "dcinfeeder"],
+    g.add_argument("--pv-element", choices=["varshunt", "converter", "dcinfeeder"],
                    default="varshunt",
-                   help="Element used to represent PV.  'varshunt' (default) "
-                        "uses VarShuntElement, which supports single-phase "
-                        "terminals in LF_USYM (the Australian residential case). "
-                        "'dcinfeeder' uses DCInfeeder with the AS/NZS 4777.2 "
-                        "volt-var / volt-watt controllers; it has no "
-                        "zero-sequence model, so it can only be used in a "
-                        "balanced three-phase study.")
+                   help="Element used to represent PV.  'varshunt' (default): "
+                        "VarShuntElement, constant P/Q at unity power factor, "
+                        "has a zero-sequence model so it works on a single "
+                        "phase in LF_USYM.  'converter' (alias 'dcinfeeder'): "
+                        "a SINCAL Converter set to plant type Photovoltaic "
+                        "with inverter limits and AS/NZS 4777.2:2020 volt-var "
+                        "and volt-watt control.  The converter has no "
+                        "zero-sequence data; if SINCAL leaves it out of the "
+                        "calculation, the post-build check lists it.")
+    ap.add_argument("--source-sk-mva", type=float, default=SOURCE_SK_MVA,
+                    help="Short-circuit power of the MV network feeder in MVA "
+                         f"(default {SOURCE_SK_MVA:.0f})")
     args = ap.parse_args()
 
     if not 0.0 <= args.pv_pct <= 100.0:
@@ -1721,7 +1970,8 @@ def main() -> None:
                        no_graphics=args.no_graphics, pv=pv,
                        phase_aware=not args.balanced,
                        merge_closed_switches=args.merge_closed_switches,
-                       legacy_ground_shunts=args.legacy_ground_shunts)
+                       legacy_ground_shunts=args.legacy_ground_shunts,
+                       source_sk_mva=args.source_sk_mva)
     except Exception as exc:
         print(f"\n[ERROR] {type(exc).__name__}: {exc}", file=sys.stderr)
         raise
