@@ -723,7 +723,8 @@ def read_branch_flows(sin_file: str):
 def run_qsts(sin_file: str, profile_folder: str, start=None, end=None, step: int = 1,
              mapping: dict | None = None, include: tuple = ("demand",),
              power_factor: float = 1.0, verbose: bool = True,
-             return_flows: bool = False):
+             return_flows: bool = False, export_limits=None,
+             limit_basis: str = "net_export", return_dispatch: bool = False):
     """
     Quasi-static time series: for each time step set every load and PV from the
     profiles, solve, and record node voltages.
@@ -739,8 +740,29 @@ def run_qsts(sin_file: str, profile_folder: str, start=None, end=None, step: int
     time, element, end, node, to_node, P_kW, Q_kvar, S_kVA, P1..P3_kW,
     I1..I3_A, I_max_A, loading_pct, loss_kW, ...  (see read_branch_flows).
     Only intervals where every assigned household has data are run.
+
+    export_limits : optional static export limits per PV, in kW.  Accepts the dict
+        {pv_name: kW}, the DataFrame `doe.limits` (column 'export_limit_kW'), or a
+        DOEResult.  Each step the PV output is clipped to the limit:
+          limit_basis="net_export" (default, how the DOE defines it): the household's
+              net export (PV - its load) may not exceed the limit, i.e.
+              PV = min(PV, limit + load)
+          limit_basis="pv_output": the PV output itself may not exceed the limit.
+    return_dispatch : also return a DataFrame (time, pv, load_kW, pv_available_kW,
+        pv_dispatched_kW, curtailed_kW, limit_kW).  Return order is
+        (volts[, flows][, dispatch]).
     """
     import pandas as pd
+    if limit_basis not in ("net_export", "pv_output"):
+        raise ValueError("limit_basis must be 'net_export' or 'pv_output'")
+    limits = None
+    if export_limits is not None:
+        el = getattr(export_limits, "limits", export_limits)      # DOEResult -> .limits
+        if hasattr(el, "to_dict"):
+            col = "export_limit_kW" if "export_limit_kW" in el.columns else el.columns[0]
+            limits = {str(k): float(v) for k, v in el[col].to_dict().items()}
+        else:
+            limits = {str(k): float(v) for k, v in dict(el).items()}
     net = SincalNetwork(sin_file)
     profiles = load_profiles(profile_folder, include)
     assign = assign_profiles(sin_file, profiles, mapping)
@@ -766,13 +788,23 @@ def run_qsts(sin_file: str, profile_folder: str, start=None, end=None, step: int
     tanphi = math.tan(math.acos(power_factor))
     frames = []
     flow_frames = []
+    dispatch_rows = []
     for i, t in enumerate(idx):
         ld, pv = {}, {}
         for lname, pname, h in pairs:
             row = profiles[h].loc[t]
             ld[lname] = (row.kW_load, row.kW_load * tanphi)
             if pname:
-                pv[pname] = (max(row.kW_pv, 0.0), max(row.kW_pv, 0.0) * tanphi)
+                avail = max(row.kW_pv, 0.0)
+                out = avail
+                lim = None
+                if limits is not None and pname in limits:
+                    lim = limits[pname]
+                    cap = lim + (row.kW_load if limit_basis == "net_export" else 0.0)
+                    out = min(avail, max(cap, 0.0))
+                pv[pname] = (out, out * tanphi)
+                if return_dispatch:
+                    dispatch_rows.append((t, pname, row.kW_load, avail, out, avail - out, lim))
         net.set_powers(loads=ld, pvs=pv)
         if not net.solve(verbose=verbose):
             print(f"  step {i} ({t}): no convergence / calc failed, skipped")
@@ -790,11 +822,15 @@ def run_qsts(sin_file: str, profile_folder: str, start=None, end=None, step: int
         if verbose and (i + 1) % 10 == 0:
             print(f"  {i + 1}/{len(idx)}")
     volts = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    out = [volts]
     if return_flows:
-        flows = (pd.concat(flow_frames, ignore_index=True)
-                 if flow_frames else pd.DataFrame())
-        return volts, flows
-    return volts
+        out.append(pd.concat(flow_frames, ignore_index=True)
+                   if flow_frames else pd.DataFrame())
+    if return_dispatch:
+        out.append(pd.DataFrame(dispatch_rows, columns=[
+            "time", "pv", "load_kW", "pv_available_kW", "pv_dispatched_kW",
+            "curtailed_kW", "limit_kW"]))
+    return out[0] if len(out) == 1 else tuple(out)
 
 
 if __name__ == "__main__":
