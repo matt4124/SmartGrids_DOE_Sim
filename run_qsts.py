@@ -156,9 +156,29 @@ ORDER BY e.Element_ID
 """
 
 
+CONVERTER_SQL = """
+SELECT  e.Element_ID   AS element_id,
+        e.Name         AS name,
+        n.Name         AS node,
+        t.Flag_Terminal AS phase_code,
+        e.Flag_State   AS in_service,
+        t.Flag_State   AS connected,
+        c.P            AS P_MW,
+        c.Q            AS Q_Mvar,
+        c.Ur_Inverter  AS Ur_kV
+FROM    DCInfeeder c
+JOIN    Element  e ON e.Element_ID = c.Element_ID
+JOIN    Terminal t ON t.Element_ID = e.Element_ID AND t.TerminalNo = 1
+JOIN    Node     n ON n.Node_ID    = t.Node_ID
+WHERE   c.Flag_Variant = 1 AND e.Flag_Variant = 1 AND t.Flag_Variant = 1
+  AND   c.Flag_DCtyp = 7
+ORDER BY e.Element_ID
+"""
+
+
 def list_pv(sin_file: str):
     """
-    Return every VarShuntElement (PV system) in the network (active variant).
+    Return every PV system (VarShuntElement or PV converter) in the network (active variant).
 
     Columns: element_id, name, node, phase, kW, kvar, Un_kV, in_service,
     connected.  SINCAL uses a load convention for VarShuntElement, so a
@@ -184,6 +204,27 @@ def list_pv(sin_file: str):
             "kW": -(r["Plf_MW"] or 0.0) * 1000.0,      # generation positive
             "kvar": -(r["Qlf_Mvar"] or 0.0) * 1000.0,
             "Un_kV": r["Ulf_kV"] or 0.0,
+            "in_service": bool(r["in_service"]),
+            "connected": bool(r["connected"]),
+        })
+    # PV converters (DCInfeeder, plant type photovoltaic), if the network has any
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        crows = con.execute(CONVERTER_SQL).fetchall()
+    except sqlite3.Error:
+        crows = []
+    finally:
+        con.close()
+    for r in crows:
+        out.append({
+            "element_id": r["element_id"],
+            "name": r["name"],
+            "node": r["node"],
+            "phase": PHASE_NAMES.get(r["phase_code"], r["phase_code"]),
+            "kW": (r["P_MW"] or 0.0) * 1000.0,         # converter: generation positive
+            "kvar": (r["Q_Mvar"] or 0.0) * 1000.0,
+            "Un_kV": r["Ur_kV"] or 0.0,
             "in_service": bool(r["in_service"]),
             "connected": bool(r["connected"]),
         })
@@ -262,6 +303,8 @@ COM_VER = "28"   # PSS-SINCAL 22.5
 _KINDS = {
     "load": ("Load", "P", "Q", +1.0),
     "pv":   ("VarShuntElement", "Plf", "Qlf", -1.0),
+    # Converter (DCInfeeder) PV: P / Q are already generation-positive
+    "converter": ("DCInfeeder", "P", "Q", +1.0),
 }
 
 
@@ -339,6 +382,27 @@ class SincalNetwork:
         except Exception:
             return ""
 
+    def _kind(self, con, kind: str, name: str) -> str:
+        """'pv' -> 'pv' (VarShuntElement) or 'converter' (DCInfeeder), whichever holds `name`."""
+        kind = kind.lower()
+        if kind != "pv":
+            return kind
+        for k in ("pv", "converter"):
+            try:
+                self._element_id(con, k, name)
+                return k
+            except KeyError:
+                continue
+        self._element_id(con, "pv", name)        # raises the KeyError with name hints
+        return "pv"
+
+    def _resolved(self, kind: str, name: str) -> str:
+        con = self._connect()
+        try:
+            return self._kind(con, kind, name)
+        finally:
+            con.close()
+
     def _element_id(self, con, kind: str, name: str) -> int:
         table = _KINDS[kind.lower()][0]
         row = con.execute(
@@ -368,9 +432,10 @@ class SincalNetwork:
     # -- public API --------------------------------------------------------
     def get(self, kind: str, name: str, *fields: str) -> dict:
         """Read raw fields (native units, e.g. P in MW) of a 'load' or 'pv'."""
-        table = _KINDS[kind.lower()][0]
         con = self._connect()
         try:
+            kind = self._kind(con, kind, name)
+            table = _KINDS[kind][0]
             eid = self._element_id(con, kind, name)
             real = self._real_fields(con, table, fields)
             cols = ", ".join(f'"{real[f]}"' for f in fields)
@@ -391,7 +456,8 @@ class SincalNetwork:
         results = []
         try:
             for kind, name, values in updates:
-                table = _KINDS[kind.lower()][0]
+                kind = self._kind(con, kind, name)
+                table = _KINDS[kind][0]
                 eid = self._element_id(con, kind, name)
                 real = self._real_fields(con, table, values)
                 sets = ", ".join(f'"{real[f]}" = ?' for f in values)
@@ -434,8 +500,13 @@ class SincalNetwork:
 
     def set_pv(self, name: str, kW: float | None = None,
                kvar: float | None = None) -> dict:
-        """Set a PV VarShunt's output (kW / kvar *generated*, positive = injecting)."""
-        return self.set("pv", name, **self._power_values("pv", kW, kvar))
+        """
+        Set a PV element's output (kW / kvar *generated*, positive = injecting).
+        Works for both PV VarShunts and PV converters; the sign convention of
+        each is handled here.
+        """
+        k = self._resolved("pv", name)
+        return self.set(k, name, **self._power_values(k, kW, kvar))
 
     def set_powers(self, loads: dict | None = None, pvs: dict | None = None) -> None:
         """
@@ -447,7 +518,8 @@ class SincalNetwork:
             self._check_load_format(name)
             ups.append(("load", name, self._power_values("load", kw, kvar)))
         for name, (kw, kvar) in (pvs or {}).items():
-            ups.append(("pv", name, self._power_values("pv", kw, kvar)))
+            k = self._resolved("pv", name)
+            ups.append((k, name, self._power_values(k, kw, kvar)))
         self._set_many(ups)
 
     def _check_load_format(self, name: str) -> None:
@@ -605,9 +677,45 @@ def read_node_voltages(sin_file: str):
         con.close()
 
 
+def read_branch_flows(sin_file: str):
+    """
+    Latest unbalanced-load-flow branch results (lines, switches, transformer,
+    feeder): one row per branch END, so each line appears twice, once at each
+    terminal (sign = flow INTO the branch at that end).
+
+    Columns: element, end (terminal 1 / 2), node, to_node, P_kW, Q_kvar, S_kVA,
+    P1..P3_kW, Q1..Q3_kvar, I1..I3_A, I_max_A, loading_pct, loss_kW, loss_kvar.
+    Empty if no results are stored.
+    """
+    import pandas as pd
+    con = sqlite3.connect(f"file:{db_path_from_sin(sin_file)}?mode=ro", uri=True)
+    try:
+        df = pd.read_sql_query(
+            "SELECT e.Name AS element, t.TerminalNo AS end, n.Name AS node, "
+            "n2.Name AS to_node, r.Flag_Phase AS phase, "
+            "r.P*1000 AS P_kW, r.Q*1000 AS Q_kvar, r.S*1000 AS S_kVA, "
+            "r.P1*1000 AS P1_kW, r.P2*1000 AS P2_kW, r.P3*1000 AS P3_kW, "
+            "r.Q1*1000 AS Q1_kvar, r.Q2*1000 AS Q2_kvar, r.Q3*1000 AS Q3_kvar, "
+            "r.I1*1000 AS I1_A, r.I2*1000 AS I2_A, r.I3*1000 AS I3_A, "
+            "r.Imax*1000 AS I_max_A, r.Imax_In AS loading_pct, "
+            "r.Pl*1000 AS loss_kW, r.Ql*1000 AS loss_kvar, r.Result_ID "
+            "FROM ULFBranchResult r "
+            "JOIN Terminal t  ON t.Terminal_ID = r.Terminal1_ID "
+            "JOIN Element  e  ON e.Element_ID  = t.Element_ID AND e.Flag_Variant = 1 "
+            "JOIN Node     n  ON n.Node_ID     = t.Node_ID "
+            "LEFT JOIN Terminal t2 ON t2.Terminal_ID = r.Terminal2_ID "
+            "LEFT JOIN Node n2 ON n2.Node_ID = t2.Node_ID "
+            "ORDER BY r.Result_ID", con)
+    finally:
+        con.close()
+    return df.drop_duplicates(["element", "end", "phase"], keep="last") \
+             .drop(columns="phase").reset_index(drop=True)
+
+
 def run_qsts(sin_file: str, profile_folder: str, start=None, end=None, step: int = 1,
              mapping: dict | None = None, include: tuple = ("demand",),
-             power_factor: float = 1.0, verbose: bool = True):
+             power_factor: float = 1.0, verbose: bool = True,
+             return_flows: bool = False):
     """
     Quasi-static time series: for each time step set every load and PV from the
     profiles, solve, and record node voltages.
@@ -618,6 +726,10 @@ def run_qsts(sin_file: str, profile_folder: str, start=None, end=None, step: int
     power_factor : loads and PV kvar = kW*tan(acos(pf)); 1.0 -> kvar 0 (the CSVs have kW only)
 
     Returns a long DataFrame: time, node, phase, U1_Un, U2_Un, U3_Un, ...
+    With return_flows=True returns (voltages, flows), where `flows` holds the
+    branch (line / switch / transformer) power and current at every step:
+    time, element, end, node, to_node, P_kW, Q_kvar, S_kVA, P1..P3_kW,
+    I1..I3_A, I_max_A, loading_pct, loss_kW, ...  (see read_branch_flows).
     Only intervals where every assigned household has data are run.
     """
     import pandas as pd
@@ -645,6 +757,7 @@ def run_qsts(sin_file: str, profile_folder: str, start=None, end=None, step: int
 
     tanphi = math.tan(math.acos(power_factor))
     frames = []
+    flow_frames = []
     for i, t in enumerate(idx):
         ld, pv = {}, {}
         for lname, pname, h in pairs:
@@ -662,9 +775,18 @@ def run_qsts(sin_file: str, profile_folder: str, start=None, end=None, step: int
                                "results are not stored in the database")
         v.insert(0, "time", t)
         frames.append(v.drop(columns="Result_ID"))
+        if return_flows:
+            fl = read_branch_flows(sin_file)
+            fl.insert(0, "time", t)
+            flow_frames.append(fl.drop(columns="Result_ID"))
         if verbose and (i + 1) % 10 == 0:
             print(f"  {i + 1}/{len(idx)}")
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    volts = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if return_flows:
+        flows = (pd.concat(flow_frames, ignore_index=True)
+                 if flow_frames else pd.DataFrame())
+        return volts, flows
+    return volts
 
 
 if __name__ == "__main__":
