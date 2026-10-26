@@ -859,6 +859,7 @@ def run_svm_qsts(model: SVMDOE, sin_file: str, profile_folder: str, *, start=Non
                  line_rating_a=None, vuf_source: str | None = None,
                  sensitivity_kw: float = 0.25, min_step_kw: float = 0.1,
                  max_step_kw: float = 2.0, max_iterations: int = 500,
+                 pv_scale: float = 1.0, load_scale: float = 1.0,
                  verbose: bool = True) -> SVMQSTSResult:
     """
     Quasi-static time series in which the trained SVMs decide the PV curtailment.
@@ -904,6 +905,9 @@ def run_svm_qsts(model: SVMDOE, sin_file: str, profile_folder: str, *, start=Non
         print(f"note: {len(unpaired)} PV have no load/profile and are held at 0 kW: {unpaired[:3]}")
 
     profiles = q.load_profiles(profile_folder, include)
+    if pv_scale != 1.0 or load_scale != 1.0:      # what-if, same as run_qsts
+        profiles = {h: df.assign(kW_pv=df["kW_pv"] * pv_scale, kW_load=df["kW_load"] * load_scale)
+                    for h, df in profiles.items()}
     assign = q.assign_profiles(sin_file, profiles, mapping)
     idx = q.common_index(profiles, {assign[h.load] for h in houses if h.load})
     if start is not None:
@@ -1035,6 +1039,41 @@ def run_svm_qsts(model: SVMDOE, sin_file: str, profile_folder: str, *, start=Non
               f"{int((lg['n_reductions'] > 0).sum())} steps; real violations in "
               f"{int((lg.get('real_violations', pd.Series(dtype=str)) != '').sum())} steps")
     return res
+
+
+def plot_dispatch(result, max_pv: int = 8):
+    """
+    Plot what a QSTS run did with the PV: accepts run_svm_qsts() results,
+    run_qsts.run_qsts(..., return_dispatch=True) tuples, or a dispatch DataFrame.
+
+    Top panel    : total PV available vs dispatched (shaded = curtailed).
+    Bottom panel : curtailment (kW) of the `max_pv` most curtailed PV systems.
+    Returns the matplotlib Figure.
+    """
+    import matplotlib.pyplot as plt
+    if hasattr(result, "dispatch"):
+        disp = result.dispatch
+    elif isinstance(result, tuple):
+        disp = result[-1]
+    else:
+        disp = result
+    tot = disp.groupby("time")[["pv_available_kW", "pv_dispatched_kW"]].sum()
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
+    a1.plot(tot.index, tot["pv_available_kW"], label="available")
+    a1.plot(tot.index, tot["pv_dispatched_kW"], label="dispatched")
+    a1.fill_between(tot.index, tot["pv_dispatched_kW"], tot["pv_available_kW"], alpha=0.3,
+                    label="curtailed")
+    a1.set_ylabel("total PV (kW)")
+    a1.legend(loc="upper right")
+    cur = disp.pivot_table(index="time", columns="pv", values="curtailed_kW", aggfunc="sum")
+    for pv_name in cur.sum().sort_values(ascending=False).index[:max_pv]:
+        a2.plot(cur.index, cur[pv_name], lw=1, label=pv_name)
+    a2.set_ylabel("curtailed (kW)")
+    if len(cur.columns):
+        a2.legend(loc="upper right", fontsize=7, ncol=2)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    return fig
 
 
 # ---------------------------------------------------------------------------

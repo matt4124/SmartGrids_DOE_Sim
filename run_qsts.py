@@ -724,7 +724,8 @@ def run_qsts(sin_file: str, profile_folder: str, start=None, end=None, step: int
              mapping: dict | None = None, include: tuple = ("demand",),
              power_factor: float = 1.0, verbose: bool = True,
              return_flows: bool = False, export_limits=None,
-             limit_basis: str = "net_export", return_dispatch: bool = False):
+             limit_basis: str = "net_export", return_dispatch: bool = False,
+             pv_scale: float = 1.0, load_scale: float = 1.0):
     """
     Quasi-static time series: for each time step set every load and PV from the
     profiles, solve, and record node voltages.
@@ -732,6 +733,8 @@ def run_qsts(sin_file: str, profile_folder: str, start=None, end=None, step: int
     start/end : optional timestamps (strings ok) clipping the common period
     step      : use every n-th profile interval (5-min data, step=6 -> 30 min)
     mapping   : {load_name: household} overrides; others are auto-assigned
+    pv_scale, load_scale : multiply every household's PV / demand profile (e.g. pv_scale=2
+                   to force violations in a test); 1.0 = the data as is
     power_factor : loads and PV kvar = kW*tan(acos(pf)); 1.0 -> kvar 0 (the CSVs have kW only)
 
     Returns a long DataFrame: time, node, phase, U1_Un, U2_Un, U3_Un, ...
@@ -765,6 +768,9 @@ def run_qsts(sin_file: str, profile_folder: str, start=None, end=None, step: int
             limits = {str(k): float(v) for k, v in dict(el).items()}
     net = SincalNetwork(sin_file)
     profiles = load_profiles(profile_folder, include)
+    if pv_scale != 1.0 or load_scale != 1.0:      # what-if: stronger sun / heavier demand
+        profiles = {h: df.assign(kW_pv=df["kW_pv"] * pv_scale, kW_load=df["kW_load"] * load_scale)
+                    for h, df in profiles.items()}
     assign = assign_profiles(sin_file, profiles, mapping)
 
     loads = list_loads(sin_file)
@@ -831,6 +837,144 @@ def run_qsts(sin_file: str, profile_folder: str, start=None, end=None, step: int
             "time", "pv", "load_kW", "pv_available_kW", "pv_dispatched_kW",
             "curtailed_kW", "limit_kW"]))
     return out[0] if len(out) == 1 else tuple(out)
+
+
+def plot_pv_profiles(profile_folder: str, start=None, end=None, step: int = 1,
+                     include: tuple = ("demand",), pv_scale: float = 1.0,
+                     load_scale: float = 1.0, households=None, max_lines: int = 40):
+    """
+    Plot the household PV profiles the QSTS will use (after pv_scale / load_scale).
+
+    Top panel    : PV output (kW) of every household (thin lines) and their mean (bold);
+                   when pv_scale != 1 the mean of the original data is dashed.
+    Bottom panel : total PV and total demand (kW) over the period every household has data.
+    Pass the same start / end / step / pv_scale as the run, so the plot shows the run's inputs.
+    households : optional list of household names to show; max_lines : cap on thin lines.
+    Returns the matplotlib Figure.
+    """
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    base = load_profiles(profile_folder, include)
+    if households is not None:
+        base = {h: base[h] for h in households}
+
+    def clip(df):
+        if start is not None:
+            df = df[df.index >= pd.Timestamp(start)]
+        if end is not None:
+            df = df[df.index <= pd.Timestamp(end)]
+        return df.iloc[::step]
+
+    scaled = {h: clip(df.assign(kW_pv=df["kW_pv"] * pv_scale, kW_load=df["kW_load"] * load_scale))
+              for h, df in base.items()}
+    orig = {h: clip(df) for h, df in base.items()}
+    scaled = {h: df for h, df in scaled.items() if len(df)}
+    if not scaled:
+        raise ValueError("no profile data in the chosen period")
+
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
+    names = list(scaled)
+    for h in names[:max_lines]:
+        a1.plot(scaled[h].index, scaled[h]["kW_pv"].clip(lower=0), lw=0.6, alpha=0.4)
+    pv = pd.concat({h: df["kW_pv"].clip(lower=0) for h, df in scaled.items()}, axis=1)
+    a1.plot(pv.index, pv.mean(axis=1), "k", lw=2, label=f"mean of {len(names)} households"
+            + (f" (x{pv_scale:g})" if pv_scale != 1.0 else ""))
+    if pv_scale != 1.0:
+        po = pd.concat({h: df["kW_pv"].clip(lower=0) for h, df in orig.items() if len(df)}, axis=1)
+        a1.plot(po.index, po.mean(axis=1), "k--", lw=1.2, label="mean, original data")
+    a1.set_ylabel("PV output (kW)")
+    a1.set_title("Household PV profiles")
+    a1.legend(loc="upper right")
+
+    try:
+        idx = common_index(base, set(names))
+        idx = clip(pd.DataFrame(index=idx)).index
+        tot_pv = sum(scaled[h]["kW_pv"].clip(lower=0).reindex(idx) for h in names)
+        tot_ld = sum(scaled[h]["kW_load"].reindex(idx) for h in names)
+        a2.plot(idx, tot_pv, label="total PV")
+        a2.plot(idx, tot_ld, label="total demand")
+        a2.legend(loc="upper right")
+    except Exception:
+        a2.text(0.5, 0.5, "no period common to all households", ha="center", transform=a2.transAxes)
+    a2.set_ylabel("kW (all households)")
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    return fig
+
+
+def plot_net_generation(profile_folder: str, sin_file: str | None = None, start=None, end=None,
+                        step: int = 1, include: tuple = ("demand",), pv_scale: float = 1.0,
+                        load_scale: float = 1.0, mapping: dict | None = None,
+                        households=None, max_lines: int = 40):
+    """
+    Plot net generation = PV output - demand (kW, + = exporting) of the households the QSTS uses.
+
+    Top panel    : net generation of every household (thin lines) and their mean (bold);
+                   the dashed line at 0 separates exporting (above) from importing (below).
+    Bottom panel : total net generation of all households (green = exporting, red = importing),
+                   with the peak marked.
+    Give `sin_file` (and `mapping` if you override the automatic assignment) to show only the
+    households assigned to the network's loads, exactly as run_qsts picks them; without it
+    every CSV in the folder is plotted.  Use the same start / end / step / pv_scale / load_scale
+    as the run.  Returns (Figure, DataFrame of net kW, one column per household, indexed by time).
+    """
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    base = load_profiles(profile_folder, include)
+    if sin_file is not None:
+        assign = assign_profiles(sin_file, base, mapping)
+        base = {h: base[h] for h in dict.fromkeys(assign.values())}
+    if households is not None:
+        base = {h: base[h] for h in households}
+
+    def clip(df):
+        if start is not None:
+            df = df[df.index >= pd.Timestamp(start)]
+        if end is not None:
+            df = df[df.index <= pd.Timestamp(end)]
+        return df.iloc[::step]
+
+    net = {}
+    for h, df in base.items():
+        df = clip(df)
+        if len(df):
+            net[h] = df["kW_pv"].clip(lower=0) * pv_scale - df["kW_load"] * load_scale
+    if not net:
+        raise ValueError("no profile data in the chosen period")
+    idx = None
+    try:                                           # period every household has data for
+        idx = clip(pd.DataFrame(index=common_index(base, set(net)))).index
+    except Exception:
+        pass
+    wide = pd.concat(net, axis=1)
+    if idx is not None and len(idx):
+        wide = wide.reindex(idx)
+
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
+    for h in list(wide.columns)[:max_lines]:
+        a1.plot(wide.index, wide[h], lw=0.6, alpha=0.4)
+    a1.plot(wide.index, wide.mean(axis=1), "k", lw=2, label=f"mean of {wide.shape[1]} households")
+    a1.axhline(0, color="grey", ls="--", lw=0.8)
+    a1.set_ylabel("net generation (kW)")
+    a1.set_title("Household net generation (PV - demand)"
+                 + (f"   PV x{pv_scale:g}" if pv_scale != 1.0 else "")
+                 + (f"   demand x{load_scale:g}" if load_scale != 1.0 else ""))
+    a1.legend(loc="upper right")
+
+    tot = wide.sum(axis=1, min_count=1)
+    a2.plot(tot.index, tot, "k", lw=1)
+    a2.fill_between(tot.index, tot, 0, where=tot >= 0, color="tab:green", alpha=0.4, label="exporting")
+    a2.fill_between(tot.index, tot, 0, where=tot < 0, color="tab:red", alpha=0.4, label="importing")
+    if tot.notna().any():
+        tpk = tot.idxmax()
+        a2.annotate(f"peak export {tot.max():.1f} kW", (tpk, tot.max()), textcoords="offset points",
+                    xytext=(8, -4), fontsize=8, arrowprops=dict(arrowstyle="-", lw=0.6))
+    a2.axhline(0, color="grey", ls="--", lw=0.8)
+    a2.set_ylabel("total net generation (kW)")
+    a2.legend(loc="upper right")
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    return fig, wide
 
 
 if __name__ == "__main__":
